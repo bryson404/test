@@ -1,29 +1,34 @@
 -- ============================================
--- KIRITO SOFTWORKS NFS CLIENT v5.1
--- Network File System Client with Storage Display
+-- KIRITO SOFTWORKS TRANSPARENT REMOTE DISK v6.0
+-- Makes remote JBOD appear as the ONLY disk on this computer
+-- All files go to server, nothing stored locally
 -- ============================================
 
-local SERVER_ID = nil
-local MODEM_SIDE = nil
-local MOUNT_POINT = "/net"
-local CURRENT_STATS = nil
+local RDISK = {
+    version = "6.0",
+    serverId = nil,
+    modemSide = nil,
+    connected = false,
+    cache = {}, -- Temporary cache for open files
+    mountPoint = "/" -- Root mount (takes over entire filesystem)
+}
 
 -- ============================================
 -- MODEM SETUP
 -- ============================================
 
-function openModem()
+function RDISK:openModem()
     local sides = {"top", "bottom", "left", "right", "front", "back"}
     for _, side in ipairs(sides) do
         if peripheral.getType(side) == "modem" then
-            MODEM_SIDE = side
+            self.modemSide = side
             rednet.open(side)
             return true
         end
     end
     for _, name in ipairs(peripheral.getNames()) do
         if peripheral.getType(name) == "modem" then
-            MODEM_SIDE = name
+            self.modemSide = name
             rednet.open(name)
             return true
         end
@@ -31,8 +36,8 @@ function openModem()
     return false
 end
 
-function findServer()
-    print("Searching for NFS server...")
+function RDISK:findServer()
+    print("Searching for JBOD server...")
     rednet.broadcast({ action = "discover" }, "jbod")
     
     local timer = os.startTimer(3)
@@ -40,7 +45,7 @@ function findServer()
         local event, id, msg, protocol = os.pullEvent()
         if event == "rednet_message" and protocol == "jbod" and msg and msg.server then
             print("Found server at computer " .. id)
-            SERVER_ID = id
+            self.serverId = id
             return true
         elseif event == "timer" and id == timer then
             return false
@@ -48,38 +53,84 @@ function findServer()
     end
 end
 
-function connect(serverId)
-    SERVER_ID = serverId
+function RDISK:connect(serverId)
+    self.serverId = serverId
+    self.connected = true
     return true
 end
 
 -- ============================================
--- NFS OPERATIONS
+-- REMOTE FILESYSTEM API
 -- ============================================
 
-function nfsList()
-    if not SERVER_ID then return nil end
-    rednet.send(SERVER_ID, { action = "list" }, "jbod")
+function RDISK:remoteList(path)
+    if not self.connected then return nil end
+    rednet.send(self.serverId, { action = "list", path = path }, "jbod")
     
     local timer = os.startTimer(5)
     while true do
         local event, id, msg = os.pullEvent()
-        if event == "rednet_message" and id == SERVER_ID then
-            return msg.files or {}
+        if event == "rednet_message" and id == self.serverId then
+            return msg.files
         elseif event == "timer" and id == timer then
             return nil
         end
     end
 end
 
-function nfsRead(filename)
-    if not SERVER_ID then return nil end
-    rednet.send(SERVER_ID, { action = "read", file = filename }, "jbod")
+function RDISK:remoteExists(path)
+    if not self.connected then return false end
+    rednet.send(self.serverId, { action = "exists", path = path }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == self.serverId then
+            return msg.exists
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+function RDISK:remoteIsDir(path)
+    if not self.connected then return false end
+    rednet.send(self.serverId, { action = "isdir", path = path }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == self.serverId then
+            return msg.isdir
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+function RDISK:remoteGetSize(path)
+    if not self.connected then return 0 end
+    rednet.send(self.serverId, { action = "getsize", path = path }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == self.serverId then
+            return msg.size or 0
+        elseif event == "timer" and id == timer then
+            return 0
+        end
+    end
+end
+
+function RDISK:remoteRead(path)
+    if not self.connected then return nil end
+    rednet.send(self.serverId, { action = "read", path = path }, "jbod")
     
     local timer = os.startTimer(5)
     while true do
         local event, id, msg = os.pullEvent()
-        if event == "rednet_message" and id == SERVER_ID then
+        if event == "rednet_message" and id == self.serverId then
             return msg.data
         elseif event == "timer" and id == timer then
             return nil
@@ -87,14 +138,14 @@ function nfsRead(filename)
     end
 end
 
-function nfsWrite(filename, data)
-    if not SERVER_ID then return false end
-    rednet.send(SERVER_ID, { action = "write", file = filename, data = data }, "jbod")
+function RDISK:remoteWrite(path, data)
+    if not self.connected then return false end
+    rednet.send(self.serverId, { action = "write", path = path, data = data }, "jbod")
     
     local timer = os.startTimer(5)
     while true do
         local event, id, msg = os.pullEvent()
-        if event == "rednet_message" and id == SERVER_ID then
+        if event == "rednet_message" and id == self.serverId then
             return msg.success
         elseif event == "timer" and id == timer then
             return false
@@ -102,14 +153,14 @@ function nfsWrite(filename, data)
     end
 end
 
-function nfsDelete(filename)
-    if not SERVER_ID then return false end
-    rednet.send(SERVER_ID, { action = "delete", file = filename }, "jbod")
+function RDISK:remoteDelete(path)
+    if not self.connected then return false end
+    rednet.send(self.serverId, { action = "delete", path = path }, "jbod")
     
     local timer = os.startTimer(3)
     while true do
         local event, id, msg = os.pullEvent()
-        if event == "rednet_message" and id == SERVER_ID then
+        if event == "rednet_message" and id == self.serverId then
             return msg.success
         elseif event == "timer" and id == timer then
             return false
@@ -117,14 +168,29 @@ function nfsDelete(filename)
     end
 end
 
-function nfsStats()
-    if not SERVER_ID then return nil end
-    rednet.send(SERVER_ID, { action = "stats" }, "jbod")
+function RDISK:remoteMakeDir(path)
+    if not self.connected then return false end
+    rednet.send(self.serverId, { action = "mkdir", path = path }, "jbod")
     
     local timer = os.startTimer(3)
     while true do
         local event, id, msg = os.pullEvent()
-        if event == "rednet_message" and id == SERVER_ID then
+        if event == "rednet_message" and id == self.serverId then
+            return msg.success
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+function RDISK:remoteStats()
+    if not self.connected then return nil end
+    rednet.send(self.serverId, { action = "stats" }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == self.serverId then
             return msg.stats
         elseif event == "timer" and id == timer then
             return nil
@@ -132,246 +198,319 @@ function nfsStats()
     end
 end
 
-function nfsExecute(filename, ...)
-    if not SERVER_ID then 
-        print("Not connected to server!")
-        return false 
+-- ============================================
+-- FS API OVERRIDE - Intercept all file calls
+-- ============================================
+
+RDISK.originalFS = {}
+
+function RDISK:installFSHook()
+    -- Save originals
+    self.originalFS.list = fs.list
+    self.originalFS.exists = fs.exists
+    self.originalFS.isDir = fs.isDir
+    self.originalFS.getSize = fs.getSize
+    self.originalFS.open = fs.open
+    self.originalFS.delete = fs.delete
+    self.originalFS.makeDir = fs.makeDir
+    self.originalFS.getFreeSpace = fs.getFreeSpace
+    self.originalFS.getCapacity = fs.getCapacity
+    
+    -- Override fs.list
+    fs.list = function(path)
+        path = path or "/"
+        -- Always return remote list
+        local files = RDISK:remoteList(path)
+        if files then
+            return files
+        end
+        return {}
     end
     
-    rednet.send(SERVER_ID, { 
-        action = "execute", 
-        file = filename,
-        args = {...}
-    }, "jbod")
-    
-    local timer = os.startTimer(10)
-    while true do
-        local event, id, msg = os.pullEvent()
-        if event == "rednet_message" and id == SERVER_ID then
-            if msg.success and msg.code then
-                local func, err = load(msg.code, "=" .. filename, "t", _ENV)
-                if not func then
-                    print("Error loading: " .. tostring(err))
-                    return false
-                end
-                local ok, result = pcall(func, ...)
-                if not ok then
-                    print("Runtime error: " .. tostring(result))
-                    return false
-                end
-                return true, result
-            else
-                print("Server error: " .. tostring(msg.error))
-                return false
-            end
-        elseif event == "timer" and id == timer then
-            print("Request timed out")
-            return false
+    -- Override fs.exists
+    fs.exists = function(path)
+        -- Block access to local directories except critical ones
+        if path:match("^/rom") or path:match("^/disk") then
+            return self.originalFS.exists(path)
         end
+        return RDISK:remoteExists(path)
+    end
+    
+    -- Override fs.isDir
+    fs.isDir = function(path)
+        if path:match("^/rom") or path:match("^/disk") then
+            return self.originalFS.isDir(path)
+        end
+        return RDISK:remoteIsDir(path)
+    end
+    
+    -- Override fs.getSize
+    fs.getSize = function(path)
+        if path:match("^/rom") or path:match("^/disk") then
+            return self.originalFS.getSize(path)
+        end
+        return RDISK:remoteGetSize(path)
+    end
+    
+    -- Override fs.open - CRITICAL: Redirect to remote
+    fs.open = function(path, mode)
+        -- Allow local access to ROM and disk drives
+        if path:match("^/rom") or path:match("^/disk") then
+            return self.originalFS.open(path, mode)
+        end
+        
+        -- Everything else goes to remote
+        mode = mode or "r"
+        
+        if mode == "r" or mode == "rb" then
+            -- Read from remote
+            local data = RDISK:remoteRead(path)
+            if not data then return nil end
+            
+            -- Return fake file handle
+            local pos = 1
+            return {
+                readAll = function()
+                    return data
+                end,
+                readLine = function()
+                    if pos > #data then return nil end
+                    local lineEnd = data:find("\n", pos) or #data + 1
+                    local line = data:sub(pos, lineEnd - 1)
+                    pos = lineEnd + 1
+                    return line
+                end,
+                close = function() end
+            }
+            
+        elseif mode == "w" or mode == "wb" or mode == "a" or mode == "ab" then
+            -- Write/Append to remote - buffer locally then send
+            local buffer = {}
+            if mode == "a" or mode == "ab" then
+                -- Append - read existing first
+                local existing = RDISK:remoteRead(path)
+                if existing then
+                    table.insert(buffer, existing)
+                end
+            end
+            
+            return {
+                write = function(self, text)
+                    table.insert(buffer, text)
+                end,
+                writeLine = function(self, text)
+                    table.insert(buffer, text)
+                    table.insert(buffer, "\n")
+                end,
+                flush = function()
+                    local data = table.concat(buffer)
+                    RDISK:remoteWrite(path, data)
+                end,
+                close = function()
+                    local data = table.concat(buffer)
+                    RDISK:remoteWrite(path, data)
+                end
+            }
+        end
+        
+        return nil
+    end
+    
+    -- Override fs.delete
+    fs.delete = function(path)
+        if path:match("^/rom") or path:match("^/disk") then
+            return self.originalFS.delete(path)
+        end
+        return RDISK:remoteDelete(path)
+    end
+    
+    -- Override fs.makeDir
+    fs.makeDir = function(path)
+        if path:match("^/rom") or path:match("^/disk") then
+            return self.originalFS.makeDir(path)
+        end
+        return RDISK:remoteMakeDir(path)
+    end
+    
+    -- Override fs.getFreeSpace - Show remote free space
+    fs.getFreeSpace = function(path)
+        local stats = RDISK:remoteStats()
+        if stats then
+            return stats.free
+        end
+        return 0
+    end
+    
+    -- Override fs.getCapacity - Show remote total
+    fs.getCapacity = function(path)
+        local stats = RDISK:remoteStats()
+        if stats then
+            return stats.total
+        end
+        return 0
+    end
+    
+    print("Filesystem hooked - all operations now go to remote server")
+end
+
+function RDISK:uninstallFSHook()
+    -- Restore originals
+    fs.list = self.originalFS.list
+    fs.exists = self.originalFS.exists
+    fs.isDir = self.originalFS.isDir
+    fs.getSize = self.originalFS.getSize
+    fs.open = self.originalFS.open
+    fs.delete = self.originalFS.delete
+    fs.makeDir = self.originalFS.makeDir
+    fs.getFreeSpace = self.originalFS.getFreeSpace
+    if self.originalFS.getCapacity then
+        fs.getCapacity = self.originalFS.getCapacity
     end
 end
 
 -- ============================================
--- STORAGE DISPLAY
+-- DISPLAY
 -- ============================================
 
-function formatBytes(b)
+function RDISK:formatBytes(b)
     if b >= 1000000000 then return string.format("%.2f GB", b/1000000000)
     elseif b >= 1000000 then return string.format("%.1f MB", b/1000000)
     elseif b >= 1000 then return string.format("%.1f KB", b/1000)
     else return b .. " B" end
 end
 
-function drawBar(percent, width)
+function RDISK:drawBar(percent, width)
     width = width or 10
     local filled = math.floor((percent / 100) * width)
     filled = math.max(0, math.min(filled, width))
     return string.rep("*", filled) .. string.rep("=", width - filled)
 end
 
-function updateStats()
-    CURRENT_STATS = nfsStats()
-end
-
-function displayStorage()
-    -- Get fresh stats
-    updateStats()
-    
-    if not CURRENT_STATS then
-        print("Storage: Unknown")
+function RDISK:displayStorage()
+    local stats = self:remoteStats()
+    if not stats then
+        print("Storage: Not connected")
         return
     end
     
-    local total = CURRENT_STATS.total or 0
-    local used = CURRENT_STATS.used or 0
-    local percent = CURRENT_STATS.percent or 0
-    
-    -- Display format: 90MB [*****=====]50% full
-    local totalStr = formatBytes(total)
-    local bar = drawBar(percent, 10)
+    local totalStr = self:formatBytes(stats.total)
+    local bar = self:drawBar(stats.percent, 10)
     
     print(totalStr)
-    print("[" .. bar .. "]" .. percent .. "% full")
-    print()
+    print("[" .. bar .. "]" .. stats.percent .. "% full")
 end
 
 -- ============================================
--- INTERACTIVE NFS SHELL
+-- SHELL LOCKDOWN - Prevent local access
 -- ============================================
 
-function nfsShell()
+function RDISK:lockdownShell()
+    -- Change directory to root (which is now remote)
+    shell.setDir("/")
+    
+    -- Override shell commands that might access local files
+    local oldRun = shell.run
+    shell.run = function(command, ...)
+        -- Block dangerous commands
+        if command == "cd" then
+            local args = {...}
+            if args[1] and (args[1]:match("^/rom") or args[1]:match("^/disk")) then
+                print("Access denied: " .. args[1])
+                return false
+            end
+        end
+        return oldRun(command, ...)
+    end
+    
+    -- Set prompt to show remote status
+    shell.setPrompt("remote> ")
+end
+
+-- ============================================
+-- MAIN INTERFACE
+-- ============================================
+
+function RDISK:mainMenu()
     while true do
-        -- Clear screen and redraw everything
         term.clear()
-        term.setCursorPos(1, 1)
+        term.setCursorPos(1,1)
         
-        -- Header
         print("===================================================")
-        print("  KIRITO SOFTWORKS NFS CLIENT")
-        print("  Server: " .. SERVER_ID)
+        print("  KIRITO SOFTWORKS REMOTE DISK v" .. self.version)
         print("===================================================")
         print()
         
-        -- Storage display (updated each loop)
-        displayStorage()
-        
-        -- Commands help
-        print("Commands:")
-        print("  ls, dir          - List remote files")
-        print("  cat <file>       - View remote file")
-        print("  edit <file>      - Edit remote file")
-        print("  run <file>       - Run remote file directly")
-        print("  put <file>       - Upload local file")
-        print("  rm <file>        - Delete remote file")
-        print("  refresh          - Refresh storage display")
-        print("  quit             - Exit")
-        print()
-        
-        -- Get command
-        write("nfs> ")
-        local input = read()
-        local args = {}
-        for word in input:gmatch("%S+") do table.insert(args, word) end
-        
-        local cmd = args[1] or ""
-        
-        if cmd == "quit" or cmd == "exit" then
-            break
-            
-        elseif cmd == "ls" or cmd == "dir" then
+        if self.connected then
+            print("Status: CONNECTED to server " .. self.serverId)
             print()
-            local files = nfsList()
-            if files then
-                print("Remote files:")
-                for _, f in ipairs(files) do
-                    print("  " .. f)
+            self:displayStorage()
+            print()
+            print("All file operations now go to REMOTE storage")
+            print("Local disk is HIDDEN")
+            print()
+            print("1. Enter remote shell")
+            print("2. Disconnect and exit")
+            print()
+            write("Choice: ")
+            local choice = read()
+            
+            if choice == "1" then
+                self:enterRemoteShell()
+            elseif choice == "2" then
+                self:uninstallFSHook()
+                print("Disconnected. Local filesystem restored.")
+                break
+            end
+        else
+            print("Status: NOT CONNECTED")
+            print()
+            print("1. Auto-discover server")
+            print("2. Manual connect")
+            print("3. Exit")
+            print()
+            write("Choice: ")
+            local choice = read()
+            
+            if choice == "1" then
+                if self:findServer() then
+                    self.connected = true
+                    self:installFSHook()
                 end
-                print("Total: " .. #files)
-            else
-                print("Failed to list files")
-            end
-            print()
-            print("Press Enter...")
-            read()
-            
-        elseif cmd == "cat" and args[2] then
-            print()
-            local data = nfsRead(args[2])
-            if data then
-                print(data)
-            else
-                print("File not found")
-            end
-            print()
-            print("Press Enter...")
-            read()
-            
-        elseif cmd == "edit" and args[2] then
-            local data = nfsRead(args[2]) or ""
-            local tmp = "/.nfs_edit_" .. args[2]
-            local h = fs.open(tmp, "w")
-            h.write(data)
-            h.close()
-            
-            -- Clear screen for editor
-            term.clear()
-            term.setCursorPos(1, 1)
-            
-            shell.run("edit", tmp)
-            
-            local h2 = fs.open(tmp, "r")
-            local newData = h2.readAll()
-            h2.close()
-            
-            if newData ~= data then
-                if nfsWrite(args[2], newData) then
-                    print()
-                    print("Saved to server")
-                else
-                    print()
-                    print("Failed to save")
+            elseif choice == "2" then
+                write("Server ID: ")
+                local id = tonumber(read())
+                if id then
+                    self:connect(id)
+                    self.connected = true
+                    self:installFSHook()
                 end
+            elseif choice == "3" then
+                break
             end
-            fs.delete(tmp)
-            print("Press Enter...")
-            read()
-            
-        elseif cmd == "run" and args[2] then
-            print()
-            local fname = args[2]:gsub("%.lua$", "") .. ".lua"
-            nfsExecute(fname, select(3, unpack(args)))
-            print()
-            print("Press Enter...")
-            read()
-            
-        elseif cmd == "put" and args[2] then
-            print()
-            local localFile = args[2]
-            local remoteName = args[3] or fs.getName(localFile)
-            
-            if not fs.exists(localFile) then
-                print("Local file not found")
-            else
-                local h = fs.open(localFile, "r")
-                local data = h.readAll()
-                h.close()
-                
-                if nfsWrite(remoteName, data) then
-                    print("Uploaded: " .. remoteName)
-                else
-                    print("Upload failed")
-                end
-            end
-            print()
-            print("Press Enter...")
-            read()
-            
-        elseif cmd == "rm" and args[2] then
-            print()
-            if nfsDelete(args[2]) then
-                print("Deleted: " .. args[2])
-            else
-                print("Delete failed")
-            end
-            print()
-            print("Press Enter...")
-            read()
-            
-        elseif cmd == "refresh" then
-            -- Just loop back and redraw
-            
-        elseif cmd ~= "" then
-            print()
-            if cmd:match("%.lua$") then
-                nfsExecute(cmd)
-            else
-                print("Unknown command: " .. cmd)
-            end
-            print()
-            print("Press Enter...")
-            read()
         end
     end
+end
+
+function RDISK:enterRemoteShell()
+    term.clear()
+    term.setCursorPos(1,1)
+    
+    print("===================================================")
+    print("  REMOTE DISK SHELL")
+    print("  All files stored on SERVER " .. self.serverId)
+    print("===================================================")
+    print()
+    print("Type 'exit' to return to menu")
+    print()
+    
+    -- Apply lockdown
+    self:lockdownShell()
+    
+    -- Start shell
+    shell.run("shell")
+    
+    -- Restore prompt
+    shell.setPrompt("> ")
 end
 
 -- ============================================
@@ -379,46 +518,27 @@ end
 -- ============================================
 
 function main()
+    term.clear()
+    term.setCursorPos(1,1)
+    
     print("===================================================")
-    print("  KIRITO SOFTWORKS NFS CLIENT v5.1")
-    print("  Run files directly from server - no download!")
+    print("  KIRITO SOFTWORKS REMOTE DISK v" .. RDISK.version)
+    print("  Transparent Remote Storage Client")
     print("===================================================")
     print()
     
-    if not openModem() then
+    if not RDISK:openModem() then
         print("ERROR: No modem found!")
         return
     end
     
-    print("1. Auto-discover server")
-    print("2. Enter server ID manually")
-    write("Choice: ")
-    local choice = read()
+    print("Modem ready")
+    print()
     
-    if choice == "1" then
-        if not findServer() then
-            print("Server not found!")
-            write("Enter ID manually: ")
-            local id = tonumber(read())
-            if id then connect(id) end
-        end
-    else
-        write("Server ID: ")
-        local id = tonumber(read())
-        if id then connect(id) end
-    end
+    RDISK:mainMenu()
     
-    if not SERVER_ID then
-        print("Not connected!")
-        return
-    end
-    
-    -- Get initial stats
-    updateStats()
-    
-    -- Start NFS shell
-    nfsShell()
-    
+    term.clear()
+    term.setCursorPos(1,1)
     print("Goodbye!")
 end
 
