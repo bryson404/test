@@ -1,14 +1,15 @@
 -- ============================================
--- KIRITO SOFTWORKS NFS SERVER v5.0
--- Network File System - Run files directly from server!
--- No local downloading needed
+-- KIRITO SOFTWORKS JBOD NFS SERVER v5.1
+-- Complete Network File System Server
+-- Supports multiple drives, remote execution, and stats
 -- ============================================
 
 local JBOD = {
-    version = "5.0",
+    version = "5.1",
     drives = {},
-    clients = {}, -- Track connected clients
-    accessLog = {}
+    clients = {},
+    accessLog = {},
+    running = true
 }
 
 -- ============================================
@@ -41,6 +42,7 @@ end
 JBOD.VALID_TYPES = {
     "drive", "disk_drive", "diskraid", "disk_raid",
     "advanced_disk_raid", "advanceddiskraid",
+    "storage", "drive_bay", "media_drive"
 }
 
 function JBOD:isValidStorageType(pType)
@@ -54,6 +56,7 @@ end
 
 function JBOD:scanDrives()
     self.drives = {}
+    print("Scanning for storage devices...")
     
     for _, name in ipairs(peripheral.getNames()) do
         local pType = peripheral.getType(name)
@@ -76,19 +79,29 @@ function JBOD:scanDrives()
                 end
                 if not mountPath then mountPath = name end
                 
+                local diskId = "N/A"
+                if drive.getDiskID then
+                    local ok, id = pcall(function() return drive.getDiskID() end)
+                    if ok and id then diskId = tostring(id) end
+                end
+                
                 table.insert(self.drives, {
                     name = name,
                     peripheral = drive,
                     pType = pType,
                     mountPath = mountPath,
+                    diskId = diskId,
                     fullPath = "/" .. mountPath,
                     isRaid = isRaid
                 })
+                
+                print("  Found: " .. name .. " [" .. pType .. "] -> " .. mountPath)
             end
         end
     end
     
     table.sort(self.drives, function(a,b) return a.name < b.name end)
+    print("Total drives: " .. #self.drives)
     return #self.drives
 end
 
@@ -164,7 +177,6 @@ function JBOD:readFile(filename)
 end
 
 function JBOD:writeFile(filename, data)
-    -- Find drive with most space
     local bestDrive = nil
     local bestFree = -1
     
@@ -190,7 +202,7 @@ function JBOD:writeFile(filename, data)
         end
     end
     
-    if not bestDrive or bestFree < #data then return false, "No space" end
+    if not bestDrive or bestFree < #data then return false, "Not enough space" end
     
     local drive = self.drives[bestDrive]
     
@@ -242,29 +254,52 @@ function JBOD:listAllFiles()
 end
 
 -- ============================================
--- REMOTE EXECUTION SUPPORT
+-- STATS
 -- ============================================
 
-function JBOD:executeFile(filename, clientId, args)
-    -- Read the file
-    local data = self:readFile(filename)
-    if not data then return false, "File not found" end
+function JBOD:getStats()
+    local total, used, free = 0, 0, 0
     
-    -- Check if it's a Lua program
-    if not filename:match("%.lua$") then
-        return false, "Not a Lua file"
+    for i = 1, #self.drives do
+        local drive = self.drives[i]
+        
+        if drive.isRaid and drive.peripheral.getDisk then
+            for slot = 1, 9 do
+                local ok, disk = pcall(function() return drive.peripheral.getDisk(slot) end)
+                if ok and disk and disk.getMountPath then
+                    local ok2, mp = pcall(function() return disk.getMountPath() end)
+                    if ok2 and mp then
+                        local path = "/" .. mp
+                        local cap = 2000000 -- Default 2MB
+                        if fs.getCapacity then
+                            local ok3, c = pcall(function() return fs.getCapacity(path) end)
+                            if ok3 then cap = c end
+                        end
+                        total = total + cap
+                        free = free + fs.getFreeSpace(path)
+                    end
+                end
+            end
+        elseif drive.fullPath then
+            local cap = 2000000
+            if fs.getCapacity then
+                local ok, c = pcall(function() return fs.getCapacity(drive.fullPath) end)
+                if ok then cap = c end
+            end
+            total = total + cap
+            free = free + fs.getFreeSpace(drive.fullPath)
+        end
     end
     
-    -- Log execution
-    table.insert(self.accessLog, {
-        time = os.time(),
-        client = clientId,
-        file = filename,
-        action = "execute"
-    })
+    used = total - free
     
-    -- Return the code for client to run
-    return true, data
+    return {
+        total = total,
+        used = used,
+        free = free,
+        percent = total > 0 and math.floor((used / total) * 100) or 0,
+        drives = #self.drives
+    }
 end
 
 -- ============================================
@@ -274,82 +309,79 @@ end
 function JBOD:handleRequest()
     print("NFS Server ready! Computer ID: " .. os.getComputerID())
     print("Waiting for clients...")
+    print("Press 'Q' to stop server")
+    print()
     
-    while true do
-        local event, id, msg, protocol = os.pullEvent("rednet_message")
+    while self.running do
+        local timer = os.startTimer(0.5)
+        local event = {os.pullEvent()}
         
-        if protocol == "jbod" and msg and msg.action then
-            -- Track client
-            self.clients[id] = os.time()
+        if event[1] == "rednet_message" then
+            local id, msg, protocol = event[2], event[3], event[4]
             
-            -- DISCOVERY
-            if msg.action == "discover" then
-                rednet.send(id, { 
-                    server = true, 
-                    version = self.version,
-                    id = os.getComputerID()
-                }, "jbod")
+            if protocol == "jbod" and msg and msg.action then
+                self.clients[id] = os.time()
                 
-            -- LIST FILES
-            elseif msg.action == "list" then
-                local files = self:listAllFiles()
-                rednet.send(id, { files = files }, "jbod")
-                
-            -- READ FILE (for viewing/editing)
-            elseif msg.action == "read" and msg.file then
-                local data = self:readFile(msg.file)
-                rednet.send(id, { 
-                    data = data,
-                    found = data ~= nil
-                }, "jbod")
-                
-            -- WRITE FILE
-            elseif msg.action == "write" and msg.file and msg.data then
-                local ok, err = self:writeFile(msg.file, msg.data)
-                rednet.send(id, { success = ok, error = err }, "jbod")
-                
-            -- DELETE FILE
-            elseif msg.action == "delete" and msg.file then
-                local ok = self:deleteFile(msg.file)
-                rednet.send(id, { success = ok }, "jbod")
-                
-            -- REMOTE EXECUTE - Run file on client without downloading
-            elseif msg.action == "execute" and msg.file then
-                local ok, codeOrErr = self:executeFile(msg.file, id, msg.args)
-                rednet.send(id, { 
-                    success = ok, 
-                    code = ok and codeOrErr or nil,
-                    error = not ok and codeOrErr or nil
-                }, "jbod")
-                
-            -- STREAM EXECUTE - For large files, stream in chunks
-            elseif msg.action == "stream_start" and msg.file then
-                local data = self:readFile(msg.file)
-                if data then
-                    -- Send in chunks of 1000 chars
-                    local chunkSize = 1000
-                    local chunks = math.ceil(#data / chunkSize)
-                    
+                -- DISCOVERY
+                if msg.action == "discover" then
                     rednet.send(id, { 
-                        stream = true,
-                        chunks = chunks,
-                        size = #data
+                        server = true, 
+                        version = self.version,
+                        id = os.getComputerID()
                     }, "jbod")
                     
-                    for i = 1, chunks do
-                        local start = (i-1) * chunkSize + 1
-                        local chunk = data:sub(start, start + chunkSize - 1)
-                        rednet.send(id, {
-                            stream_chunk = i,
-                            data = chunk
-                        }, "jbod")
-                        sleep(0.05) -- Prevent overflow
-                    end
+                -- LIST FILES
+                elseif msg.action == "list" then
+                    local files = self:listAllFiles()
+                    rednet.send(id, { files = files }, "jbod")
                     
-                    rednet.send(id, { stream_end = true }, "jbod")
-                else
-                    rednet.send(id, { error = "File not found" }, "jbod")
+                -- READ FILE
+                elseif msg.action == "read" and msg.file then
+                    local data = self:readFile(msg.file)
+                    rednet.send(id, { 
+                        data = data,
+                        found = data ~= nil
+                    }, "jbod")
+                    
+                -- WRITE FILE
+                elseif msg.action == "write" and msg.file and msg.data then
+                    local ok, err = self:writeFile(msg.file, msg.data)
+                    rednet.send(id, { success = ok, error = err }, "jbod")
+                    
+                -- DELETE FILE
+                elseif msg.action == "delete" and msg.file then
+                    local ok = self:deleteFile(msg.file)
+                    rednet.send(id, { success = ok }, "jbod")
+                    
+                -- STATS
+                elseif msg.action == "stats" then
+                    local stats = self:getStats()
+                    rednet.send(id, { stats = stats }, "jbod")
+                    
+                -- EXECUTE FILE
+                elseif msg.action == "execute" and msg.file then
+                    local data = self:readFile(msg.file)
+                    if data then
+                        rednet.send(id, { 
+                            success = true,
+                            code = data
+                        }, "jbod")
+                    else
+                        rednet.send(id, { 
+                            success = false,
+                            error = "File not found"
+                        }, "jbod")
+                    end
                 end
+            end
+            
+        elseif event[1] == "timer" and event[2] == timer then
+            -- Just the check timer, continue
+            
+        elseif event[1] == "key" then
+            if event[2] == keys.q then
+                print("Stopping server...")
+                self.running = false
             end
         end
     end
@@ -360,23 +392,35 @@ end
 -- ============================================
 
 function main()
+    term.clear()
+    term.setCursorPos(1,1)
+    
     print("===================================================")
-    print("  KIRITO SOFTWORKS NFS SERVER v" .. JBOD.version)
+    print("  KIRITO SOFTWORKS JBOD NFS SERVER v" .. JBOD.version)
     print("  Network File System - Remote Execution Enabled")
     print("===================================================")
     print()
     
     if not JBOD:openModem() then
         print("ERROR: No modem found!")
+        print("Place a wireless modem on any side")
         return
     end
     
-    print("Scanning drives...")
-    local count = JBOD:scanDrives()
-    print("Found " .. count .. " drives")
-    print()
+    JBOD:scanDrives()
     
+    if #JBOD.drives == 0 then
+        print()
+        print("WARNING: No drives found!")
+        print("Insert disks and press any key to retry...")
+        os.pullEvent("key")
+        JBOD:scanDrives()
+    end
+    
+    print()
     JBOD:handleRequest()
+    
+    print("Server stopped")
 end
 
 main()
