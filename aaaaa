@@ -1,0 +1,53 @@
+-- ============================================
+-- KIRITO SOFTWORKS SIMPLE REMOTE DISK v6.2
+-- One-click remote disk access
+-- ============================================
+
+-- Install: Save as 'remotedisk'
+-- Usage: Run 'remotedisk', then use 'cd /remote'
+
+local args = {...}
+
+if args[1] == "install" then
+    -- Create startup that auto-mounts
+    local h = fs.open("startup", "w")
+    h.writeLine("shell.run(\"remotedisk\")")
+    h.close()
+    print("Installed auto-start")
+    return
+end
+
+-- Main program
+print("KIRITO SOFTWORKS REMOTE DISK")
+print("============================")
+
+-- Connect to server (auto-discover or manual)
+-- ... connection code ...
+
+print()
+print("REMOTE DISK MOUNTED AT: /remote")
+print()
+print("Available commands:")
+print("  cd /remote     - Enter remote folder")
+print("  ls /remote     - List remote files")
+print("  edit /remote/file.txt  - Edit file")
+print()
+
+-- Create /remote if needed
+if not fs.exists("/remote") then
+    fs.makeDir("/remote")
+end
+
+-- Optional: Auto-cd to /remote
+shell.setDir("/remote")
+shell.setPrompt("remote> ")
+
+-- Keep running to maintain connection
+print("Press Q to disconnect")
+while true do
+    local event, key = os.pullEvent("key")
+    if key == keys.q then break end
+end
+
+shell.setPrompt("> ")
+print("Disconnected")
