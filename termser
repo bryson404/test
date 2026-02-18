@@ -1,0 +1,330 @@
+-- ============================================
+-- KIRITO SOFTWORKS TERMINAL SERVER v1.0
+-- Run on advanced computers to accept terminal connections
+-- ============================================
+
+local TSERVER = {
+    name = "KSW Server",
+    serverType = "advanced",
+    version = "1.0",
+    running = true,
+    clients = {},
+    activeClient = nil,
+    modemSide = nil,
+    shellRunning = false
+}
+
+-- Configuration
+TSERVER.name = "Server " .. os.getComputerID()
+
+-- ============================================
+-- MODEM
+-- ============================================
+
+function TSERVER:openModem()
+    local sides = {"top", "bottom", "left", "right", "front", "back"}
+    for _, side in ipairs(sides) do
+        if peripheral.getType(side) == "modem" then
+            self.modemSide = side
+            rednet.open(side)
+            return true
+        end
+    end
+    return false
+end
+
+-- ============================================
+-- DISPLAY BUFFER
+-- ============================================
+
+TSERVER.buffer = {}
+TSERVER.cursorX = 1
+TSERVER.cursorY = 1
+TSERVER.width = 51
+TSERVER.height = 19
+
+function TSERVER:initBuffer()
+    self.buffer = {}
+    for i = 1, self.height do
+        self.buffer[i] = ""
+    end
+end
+
+function TSERVER:bufferWrite(text)
+    local line = self.buffer[self.cursorY] or ""
+    -- Insert at cursor position
+    local before = line:sub(1, self.cursorX - 1)
+    local after = line:sub(self.cursorX + #text)
+    self.buffer[self.cursorY] = before .. text .. after
+    
+    self.cursorX = self.cursorX + #text
+    if self.cursorX > self.width then
+        self.cursorX = 1
+        self.cursorY = self.cursorY + 1
+    end
+    
+    self:sendDisplay()
+end
+
+function TSERVER:bufferNewLine()
+    self.cursorY = self.cursorY + 1
+    self.cursorX = 1
+    if self.cursorY > self.height then
+        -- Scroll up
+        table.remove(self.buffer, 1)
+        self.buffer[self.height] = ""
+        self.cursorY = self.height
+    end
+    self:sendDisplay()
+end
+
+function TSERVER:bufferClear()
+    self:initBuffer()
+    self.cursorX = 1
+    self.cursorY = 1
+    self:sendDisplay()
+end
+
+function TSERVER:sendDisplay()
+    if self.activeClient then
+        rednet.send(self.activeClient, {
+            ks_display = self.buffer,
+            cursorX = self.cursorX,
+            cursorY = self.cursorY
+        }, "ksw_term")
+    end
+end
+
+-- ============================================
+-- VIRTUAL SHELL
+-- ============================================
+
+TSERVER.virtualEnv = {}
+TSERVER.commandHistory = {}
+
+function TSERVER:initVirtualEnv()
+    self.virtualEnv = {
+        print = function(...)
+            local args = {...}
+            local text = table.concat(args, " ")
+            TSERVER:bufferWrite(text)
+            TSERVER:bufferNewLine()
+        end,
+        write = function(text)
+            TSERVER:bufferWrite(tostring(text))
+        end,
+        read = function()
+            -- Signal we need input
+            TSERVER:sendDisplay()
+            -- Wait for input from client
+            local input = ""
+            while true do
+                local event = {os.pullEvent()}
+                if event[1] == "rednet_message" then
+                    local msg = event[3]
+                    if msg.action == "ks_char" then
+                        input = input .. msg.char
+                        TSERVER:bufferWrite(msg.char)
+                    elseif msg.action == "ks_key" then
+                        if msg.key == keys.enter then
+                            TSERVER:bufferNewLine()
+                            return input
+                        elseif msg.key == keys.backspace and #input > 0 then
+                            input = input:sub(1, -2)
+                            -- Handle backspace visually
+                        end
+                    end
+                end
+            end
+        end,
+        clear = function()
+            TSERVER:bufferClear()
+        end,
+        sleep = sleep,
+        os = {
+            time = os.time,
+            clock = os.clock,
+            date = os.date
+        }
+    }
+    setmetatable(self.virtualEnv, {__index = _G})
+end
+
+function TSERVER:executeCommand(cmd)
+    -- Built-in commands
+    if cmd == "clear" or cmd == "cls" then
+        self:bufferClear()
+        return
+    elseif cmd == "help" then
+        self.virtualEnv.print("KSW Terminal Server Commands:")
+        self.virtualEnv.print("  clear, cls - Clear screen")
+        self.virtualEnv.print("  ls, dir    - List files")
+        self.virtualEnv.print("  lua        - Enter Lua mode")
+        self.virtualEnv.print("  exit       - Disconnect client")
+        return
+    elseif cmd == "ls" or cmd == "dir" then
+        local files = fs.list("/")
+        for _, f in ipairs(files) do
+            local attr = fs.isDir("/" .. f) and "<DIR>" or "     "
+            self.virtualEnv.print(attr .. " " .. f)
+        end
+        return
+    elseif cmd == "exit" then
+        if self.activeClient then
+            rednet.send(self.activeClient, { ks_disconnect = true }, "ksw_term")
+            self.activeClient = nil
+        end
+        return
+    elseif cmd == "lua" then
+        self.virtualEnv.print("Lua mode (type 'exit' to quit)")
+        while true do
+            self.virtualEnv.write("lua> ")
+            local code = self.virtualEnv.read()
+            if code == "exit" then break end
+            
+            local func, err = load(code, "lua", "t", self.virtualEnv)
+            if not func then
+                self.virtualEnv.print("Error: " .. tostring(err))
+            else
+                local ok, result = pcall(func)
+                if not ok then
+                    self.virtualEnv.print("Runtime: " .. tostring(result))
+                elseif result ~= nil then
+                    self.virtualEnv.print(tostring(result))
+                end
+            end
+        end
+        return
+    end
+    
+    -- Try to run as shell command
+    shell.run(cmd)
+end
+
+function TSERVER:runShell()
+    self.shellRunning = true
+    self:initVirtualEnv()
+    self:bufferClear()
+    
+    self.virtualEnv.print("KSW Terminal Server " .. self.version)
+    self.virtualEnv.print("Name: " .. self.name)
+    self.virtualEnv.print("Type 'help' for commands")
+    self.virtualEnv.print("")
+    
+    while self.shellRunning and self.activeClient do
+        self.virtualEnv.write("> ")
+        local cmd = self.virtualEnv.read()
+        
+        if cmd and #cmd > 0 then
+            table.insert(self.commandHistory, cmd)
+            self:executeCommand(cmd)
+        end
+    end
+end
+
+-- ============================================
+-- NETWORK HANDLER
+-- ============================================
+
+function TSERVER:handleNetwork()
+    print("Terminal Server: " .. self.name)
+    print("Computer ID: " .. os.getComputerID())
+    print("Waiting for terminal connections...")
+    print("Press 'Q' to stop")
+    print()
+    
+    self:initBuffer()
+    
+    while self.running do
+        local timer = os.startTimer(0.5)
+        local event = {os.pullEvent()}
+        
+        if event[1] == "rednet_message" then
+            local id, msg = event[2], event[3]
+            
+            if msg.action == "ks_discover" then
+                -- Respond to discovery
+                rednet.send(id, {
+                    ks_server = true,
+                    name = self.name,
+                    server_type = self.serverType,
+                    version = self.version
+                }, "ksw_term")
+                
+            elseif msg.action == "ks_connect" then
+                -- New connection
+                if self.activeClient and self.activeClient ~= id then
+                    -- Kick existing client
+                    rednet.send(self.activeClient, { ks_disconnect = true }, "ksw_term")
+                end
+                
+                self.activeClient = id
+                self.clients[id] = {
+                    connected = os.time(),
+                    termWidth = msg.termWidth or 51,
+                    termHeight = msg.termHeight or 19
+                }
+                
+                rednet.send(id, {
+                    ks_accepted = true,
+                    name = self.name
+                }, "ksw_term")
+                
+                print("Client " .. id .. " connected")
+                
+                -- Start shell for this client
+                self:runShell()
+                
+            elseif msg.action == "ks_disconnect" then
+                if self.activeClient == id then
+                    self.activeClient = nil
+                    self.shellRunning = false
+                    print("Client " .. id .. " disconnected")
+                end
+                
+            elseif msg.action == "ks_key" and self.activeClient == id then
+                -- Key pressed - handled in shell read()
+                
+            elseif msg.action == "ks_char" and self.activeClient == id then
+                -- Char pressed - handled in shell read()
+                
+            elseif msg.action == "ks_clear" and self.activeClient == id then
+                self:bufferClear()
+                
+            elseif msg.action == "ks_ping" and self.activeClient == id then
+                -- Keepalive, respond with display
+                self:sendDisplay()
+            end
+            
+        elseif event[1] == "key" then
+            if event[2] == keys.q and not self.activeClient then
+                self.running = false
+            end
+        end
+    end
+end
+
+-- ============================================
+-- MAIN
+-- ============================================
+
+function main()
+    term.clear()
+    term.setCursorPos(1,1)
+    
+    print("===================================================")
+    print("  KIRITO SOFTWORKS TERMINAL SERVER v" .. TSERVER.version)
+    print("===================================================")
+    print()
+    
+    if not TSERVER:openModem() then
+        print("ERROR: No modem found!")
+        return
+    end
+    
+    TSERVER:handleNetwork()
+    
+    print("Server stopped")
+end
+
+main()
