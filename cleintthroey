@@ -1,0 +1,272 @@
+-- ============================================
+-- KIRITO SOFTWORKS JBOD CLIENT
+-- Connects to remote JBOD server
+-- ============================================
+
+local SERVER_ID = nil -- Will auto-discover or set manually
+
+-- Find the JBOD server
+function findServer()
+    print("Searching for JBOD server...")
+    rednet.open("back") -- Adjust side as needed
+    
+    -- Broadcast discovery
+    rednet.broadcast({ action = "discover" }, "jbod")
+    
+    -- Wait for response
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg, protocol = os.pullEvent()
+        if event == "rednet_message" and protocol == "jbod" and msg.server then
+            print("Found server at computer " .. id)
+            SERVER_ID = id
+            return true
+        elseif event == "timer" and id == timer then
+            print("No server found!")
+            return false
+        end
+    end
+end
+
+-- Connect to specific server
+function connect(serverId)
+    rednet.open("back")
+    SERVER_ID = serverId
+    print("Connected to JBOD server " .. serverId)
+end
+
+-- List files on remote JBOD
+function listFiles()
+    if not SERVER_ID then
+        print("Not connected!")
+        return nil
+    end
+    
+    rednet.send(SERVER_ID, { action = "list" }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.files or {}
+        elseif event == "timer" and id == timer then
+            print("Request timed out")
+            return nil
+        end
+    end
+end
+
+-- Download file from remote JBOD
+function download(filename, localName)
+    if not SERVER_ID then
+        print("Not connected!")
+        return false
+    end
+    
+    rednet.send(SERVER_ID, { action = "read", file = filename }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            if msg.data then
+                local h = fs.open(localName or filename, "w")
+                if h then
+                    h.write(msg.data)
+                    h.close()
+                    print("Downloaded: " .. filename)
+                    return true
+                end
+            else
+                print("File not found")
+                return false
+            end
+        elseif event == "timer" and id == timer then
+            print("Download timed out")
+            return false
+        end
+    end
+end
+
+-- Upload file to remote JBOD
+function upload(localFile, remoteName)
+    if not SERVER_ID then
+        print("Not connected!")
+        return false
+    end
+    
+    if not fs.exists(localFile) or fs.isDir(localFile) then
+        print("Local file not found")
+        return false
+    end
+    
+    local h = fs.open(localFile, "r")
+    local data = h.readAll()
+    h.close()
+    
+    rednet.send(SERVER_ID, { 
+        action = "write", 
+        file = remoteName or fs.getName(localFile),
+        data = data 
+    }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            if msg.success then
+                print("Uploaded successfully")
+                return true
+            else
+                print("Upload failed: " .. tostring(msg.error))
+                return false
+            end
+        elseif event == "timer" and id == timer then
+            print("Upload timed out")
+            return false
+        end
+    end
+end
+
+-- Get server stats
+function getStats()
+    if not SERVER_ID then return nil end
+    
+    rednet.send(SERVER_ID, { action = "stats" }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.stats
+        elseif event == "timer" and id == timer then
+            return nil
+        end
+    end
+end
+
+-- Mount remote JBOD as local folder (virtual filesystem)
+function mount(mountPoint)
+    mountPoint = mountPoint or "/remote_pool"
+    
+    if not SERVER_ID then
+        print("Not connected!")
+        return false
+    end
+    
+    -- Create mount directory
+    if not fs.exists(mountPoint) then
+        fs.makeDir(mountPoint)
+    end
+    
+    print("Mounting remote JBOD to " .. mountPoint .. "...")
+    
+    -- Sync all files to local mount point
+    local files = listFiles()
+    if not files then return false end
+    
+    for _, fname in ipairs(files) do
+        download(fname, mountPoint .. "/" .. fname)
+    end
+    
+    print("Mounted " .. #files .. " files to " .. mountPoint)
+    print("Use 'sync' to refresh")
+    
+    return true
+end
+
+-- Interactive client shell
+function interactive()
+    print("===================================================")
+    print("     KIRITO SOFTWORKS JBOD CLIENT")
+    print("===================================================")
+    print()
+    
+    -- Auto-discover or manual connect
+    print("1. Auto-discover server")
+    print("2. Connect to specific ID")
+    write("Choice: ")
+    local choice = read()
+    
+    if choice == "1" then
+        if not findServer() then return end
+    else
+        write("Server ID: ")
+        local id = tonumber(read())
+        if id then connect(id) else return end
+    end
+    
+    print()
+    print("Commands: list, get <file>, put <file>, mount, stats, quit")
+    
+    while true do
+        write("jbod> ")
+        local input = read()
+        local args = {}
+        for word in input:gmatch("%S+") do table.insert(args, word) end
+        
+        local cmd = args[1] or ""
+        
+        if cmd == "quit" or cmd == "q" then
+            print("Goodbye!")
+            break
+            
+        elseif cmd == "list" or cmd == "ls" then
+            local files = listFiles()
+            if files then
+                for _, f in ipairs(files) do
+                    print("  " .. f)
+                end
+                print("Total: " .. #files .. " files")
+            end
+            
+        elseif cmd == "get" and args[2] then
+            local saveAs = args[3] or args[2]
+            download(args[2], saveAs)
+            
+        elseif cmd == "put" and args[2] then
+            local remoteName = args[3] or fs.getName(args[2])
+            upload(args[2], remoteName)
+            
+        elseif cmd == "mount" then
+            mount(args[2] or "/remote_pool")
+            
+        elseif cmd == "stats" then
+            local s = getStats()
+            if s then
+                print("Drives: " .. s.drives)
+                print("Used: " .. s.used .. " / " .. s.total)
+                print("Free: " .. s.free)
+            end
+            
+        elseif cmd == "sync" then
+            mount(args[2] or "/remote_pool")
+        end
+    end
+end
+
+-- API for other programs
+function exportAPI()
+    _G.JBOD_CLIENT = {
+        connect = connect,
+        list = listFiles,
+        read = function(fname) 
+            rednet.send(SERVER_ID, { action = "read", file = fname }, "jbod")
+            local _, _, msg = os.pullEvent("rednet_message")
+            return msg and msg.data
+        end,
+        write = upload,
+        stats = getStats,
+        mount = mount
+    }
+end
+
+-- Main
+local args = {...}
+if args[1] == "api" then
+    connect(tonumber(args[2]) or error("Need server ID"))
+    exportAPI()
+    print("JBOD_CLIENT API ready")
+else
+    interactive()
+end
