@@ -1,0 +1,391 @@
+-- ============================================
+-- KIRITO SOFTWORKS JBOD SERVER v4.2
+-- Fixed: Actually responds to client connections!
+-- ============================================
+
+local JBOD = {
+    version = "4.2",
+    drives = {},
+    debug = true,
+    mountPoint = "/pool"
+}
+
+-- ============================================
+-- MODEM SETUP - AUTO DETECT
+-- ============================================
+
+function JBOD:openModem()
+    local sides = {"top", "bottom", "left", "right", "front", "back"}
+    
+    for _, side in ipairs(sides) do
+        if peripheral.getType(side) == "modem" then
+            rednet.open(side)
+            print("Modem opened on " .. side)
+            return true
+        end
+    end
+    
+    -- Check for wired modems
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            rednet.open(name)
+            print("Modem opened: " .. name)
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- ============================================
+-- DRIVE DETECTION
+-- ============================================
+
+JBOD.VALID_TYPES = {
+    "drive", "disk_drive", "diskraid", "disk_raid",
+    "advanced_disk_raid", "advanceddiskraid",
+}
+
+function JBOD:isValidStorageType(pType)
+    if not pType then return false end
+    pType = pType:lower()
+    for _, v in ipairs(self.VALID_TYPES) do
+        if pType:find(v) then return true end
+    end
+    return false
+end
+
+function JBOD:scanDrives()
+    self.drives = {}
+    
+    for _, name in ipairs(peripheral.getNames()) do
+        local pType = peripheral.getType(name)
+        
+        if self:isValidStorageType(pType) then
+            local drive = peripheral.wrap(name)
+            local isRaid = pType:find("raid") ~= nil
+            
+            -- Check for media
+            local hasMedia = isRaid  -- Raids always have media
+            
+            if not isRaid and drive.isDiskPresent then
+                local ok, result = pcall(function() return drive.isDiskPresent() end)
+                hasMedia = ok and result
+            end
+            
+            if hasMedia then
+                local mountPath = nil
+                
+                if drive.getMountPath then
+                    local ok, mp = pcall(function() return drive.getMountPath() end)
+                    if ok then mountPath = mp end
+                end
+                
+                if not mountPath then
+                    mountPath = name
+                end
+                
+                table.insert(self.drives, {
+                    name = name,
+                    peripheral = drive,
+                    pType = pType,
+                    mountPath = mountPath,
+                    fullPath = "/" .. mountPath,
+                    isRaid = isRaid
+                })
+                
+                if self.debug then
+                    print("  Drive: " .. name .. " [" .. pType .. "]")
+                end
+            end
+        end
+    end
+    
+    table.sort(self.drives, function(a,b) return a.name < b.name end)
+    print("Total drives: " .. #self.drives)
+    return #self.drives
+end
+
+-- ============================================
+-- FILE OPERATIONS
+-- ============================================
+
+function JBOD:getDriveFiles(driveIndex)
+    local drive = self.drives[driveIndex]
+    local files = {}
+    local p = drive.peripheral
+    
+    if drive.isRaid and p.getDisk then
+        -- Handle Disk Raid - check each slot
+        for slot = 1, 9 do
+            local ok, disk = pcall(function() return p.getDisk(slot) end)
+            if ok and disk and disk.getMountPath then
+                local ok2, mp = pcall(function() return disk.getMountPath() end)
+                if ok2 and mp then
+                    local path = "/" .. mp
+                    if fs.isDir(path) then
+                        for _, fname in ipairs(fs.list(path)) do
+                            local fpath = path .. "/" .. fname
+                            if not fs.isDir(fpath) then
+                                table.insert(files, {
+                                    name = fname,
+                                    size = fs.getSize(fpath),
+                                    slot = slot,
+                                    path = fpath
+                                })
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+    elseif drive.fullPath and fs.isDir(drive.fullPath) then
+        -- Standard drive
+        for _, fname in ipairs(fs.list(drive.fullPath)) do
+            local fpath = drive.fullPath .. "/" .. fname
+            if not fs.isDir(fpath) then
+                table.insert(files, {
+                    name = fname,
+                    size = fs.getSize(fpath),
+                    path = fpath
+                })
+            end
+        end
+    end
+    
+    return files
+end
+
+function JBOD:listAllFiles()
+    local allFiles = {}
+    for i = 1, #self.drives do
+        local files = self:getDriveFiles(i)
+        for _, f in ipairs(files) do
+            table.insert(allFiles, f)
+        end
+    end
+    return allFiles
+end
+
+function JBOD:readFile(filename)
+    for i, drive in ipairs(self.drives) do
+        local files = self:getDriveFiles(i)
+        for _, f in ipairs(files) do
+            if f.name == filename then
+                local h = fs.open(f.path, "r")
+                if h then
+                    local data = h.readAll()
+                    h.close()
+                    return data
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function JBOD:writeFile(filename, data)
+    -- Find drive with most space
+    local bestDrive = nil
+    local bestFree = -1
+    
+    for i, drive in ipairs(self.drives) do
+        local free = 0
+        
+        if drive.isRaid and drive.peripheral.getDisk then
+            for slot = 1, 9 do
+                local ok, disk = pcall(function() return drive.peripheral.getDisk(slot) end)
+                if ok and disk and disk.getMountPath then
+                    local ok2, mp = pcall(function() return disk.getMountPath() end)
+                    if ok2 and mp then
+                        free = free + fs.getFreeSpace("/" .. mp)
+                    end
+                end
+            end
+        elseif drive.fullPath then
+            free = fs.getFreeSpace(drive.fullPath)
+        end
+        
+        if free > bestFree then
+            bestFree = free
+            bestDrive = i
+        end
+    end
+    
+    if not bestDrive or bestFree < #data then
+        return false, "Not enough space"
+    end
+    
+    local drive = self.drives[bestDrive]
+    
+    -- Write to first available location in the drive
+    if drive.isRaid and drive.peripheral.getDisk then
+        for slot = 1, 9 do
+            local ok, disk = pcall(function() return drive.peripheral.getDisk(slot) end)
+            if ok and disk and disk.getMountPath then
+                local ok2, mp = pcall(function() return disk.getMountPath() end)
+                if ok2 and mp then
+                    local path = "/" .. mp .. "/" .. filename
+                    local h = fs.open(path, "w")
+                    if h then
+                        h.write(data)
+                        h.close()
+                        return true
+                    end
+                end
+            end
+        end
+    else
+        local path = drive.fullPath .. "/" .. filename
+        local h = fs.open(path, "w")
+        if h then
+            h.write(data)
+            h.close()
+            return true
+        end
+    end
+    
+    return false, "Write failed"
+end
+
+function JBOD:deleteFile(filename)
+    for i, drive in ipairs(self.drives) do
+        local files = self:getDriveFiles(i)
+        for _, f in ipairs(files) do
+            if f.name == filename then
+                fs.delete(f.path)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function JBOD:getStats()
+    local total, free = 0, 0
+    for i, drive in ipairs(self.drives) do
+        if drive.isRaid and drive.peripheral.getDisk then
+            for slot = 1, 9 do
+                local ok, disk = pcall(function() return drive.peripheral.getDisk(slot) end)
+                if ok and disk and disk.getMountPath then
+                    local ok2, mp = pcall(function() return disk.getMountPath() end)
+                    if ok2 and mp then
+                        local path = "/" .. mp
+                        if fs.getCapacity then
+                            local ok3, cap = pcall(function() return fs.getCapacity(path) end)
+                            if ok3 then total = total + cap end
+                        end
+                        free = free + fs.getFreeSpace(path)
+                    end
+                end
+            end
+        elseif drive.fullPath then
+            if fs.getCapacity then
+                local ok, cap = pcall(function() return fs.getCapacity(drive.fullPath) end)
+                if ok then total = total + cap end
+            end
+            free = free + fs.getFreeSpace(drive.fullPath)
+        end
+    end
+    
+    return {
+        drives = #self.drives,
+        total = total,
+        used = total - free,
+        free = free,
+        percent = total > 0 and math.floor(((total-free)/total)*100) or 0
+    }
+end
+
+-- ============================================
+-- NETWORK SERVER - FIXED!
+-- ============================================
+
+function JBOD:handleClient()
+    print("Server ready! Computer ID: " .. os.getComputerID())
+    print("Waiting for connections...")
+    
+    while true do
+        local event, id, msg, protocol = os.pullEvent("rednet_message")
+        
+        if protocol == "jbod" and msg and msg.action then
+            print("[" .. id .. "] Request: " .. msg.action)
+            
+            -- DISCOVERY - Respond to auto-discover
+            if msg.action == "discover" then
+                rednet.send(id, { server = true, version = self.version }, "jbod")
+                print("  -> Sent discovery response")
+                
+            -- LIST FILES
+            elseif msg.action == "list" then
+                local files = self:listAllFiles()
+                local names = {}
+                for _, f in ipairs(files) do
+                    table.insert(names, f.name)
+                end
+                rednet.send(id, { files = names }, "jbod")
+                print("  -> Sent " .. #names .. " files")
+                
+            -- READ FILE
+            elseif msg.action == "read" and msg.file then
+                local data = self:readFile(msg.file)
+                rednet.send(id, { data = data }, "jbod")
+                if data then
+                    print("  -> Sent file (" .. #data .. " bytes)")
+                else
+                    print("  -> File not found")
+                end
+                
+            -- WRITE FILE
+            elseif msg.action == "write" and msg.file and msg.data then
+                local ok, err = self:writeFile(msg.file, msg.data)
+                rednet.send(id, { success = ok, error = err }, "jbod")
+                if ok then
+                    print("  -> Saved file (" .. #msg.data .. " bytes)")
+                else
+                    print("  -> Failed: " .. tostring(err))
+                end
+                
+            -- STATS
+            elseif msg.action == "stats" then
+                rednet.send(id, { stats = self:getStats() }, "jbod")
+                print("  -> Sent stats")
+            end
+        end
+    end
+end
+
+-- ============================================
+-- MAIN
+-- ============================================
+
+function main()
+    print("===================================================")
+    print("     KIRITO SOFTWORKS JBOD SERVER v" .. JBOD.version)
+    print("===================================================")
+    print()
+    
+    -- Open modem
+    if not JBOD:openModem() then
+        print("ERROR: No modem found!")
+        print("Place a wireless modem on any side")
+        return
+    end
+    
+    -- Scan drives
+    print("Scanning drives...")
+    JBOD:scanDrives()
+    
+    if #JBOD.drives == 0 then
+        print("WARNING: No drives found!")
+        print("Insert disks and restart")
+    end
+    
+    print()
+    
+    -- Start server
+    JBOD:handleClient()
+end
+
+main()
