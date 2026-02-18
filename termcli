@@ -1,0 +1,391 @@
+-- ============================================
+-- KIRITO SOFTWORKS TERMINAL CLIENT v1.0
+-- Makes this computer act as a terminal for multiple servers
+-- Connects to advanced computers and displays their output
+-- ============================================
+
+local TERM = {
+    version = "1.0",
+    servers = {}, -- List of connected servers
+    activeServer = nil,
+    running = true,
+    history = {},
+    modemSide = nil
+}
+
+-- ============================================
+-- MODEM SETUP
+-- ============================================
+
+function TERM:openModem()
+    local sides = {"top", "bottom", "left", "right", "front", "back"}
+    for _, side in ipairs(sides) do
+        if peripheral.getType(side) == "modem" then
+            self.modemSide = side
+            rednet.open(side)
+            return true
+        end
+    end
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            self.modemSide = name
+            rednet.open(name)
+            return true
+        end
+    end
+    return false
+end
+
+-- ============================================
+-- SERVER DISCOVERY & CONNECTION
+-- ============================================
+
+function TERM:discoverServers()
+    print("Scanning for KSW servers...")
+    self.servers = {}
+    
+    rednet.broadcast({ action = "ks_discover", type = "terminal" }, "ksw_term")
+    
+    local timer = os.startTimer(3)
+    local found = 0
+    
+    while true do
+        local event, id, msg, protocol = os.pullEvent()
+        
+        if event == "rednet_message" and protocol == "ksw_term" and msg then
+            if msg.ks_server then
+                table.insert(self.servers, {
+                    id = id,
+                    name = msg.name or "Server " .. id,
+                    type = msg.server_type or "generic",
+                    version = msg.version or "unknown"
+                })
+                found = found + 1
+                print("  Found: " .. msg.name .. " (ID: " .. id .. ")")
+            end
+            
+        elseif event == "timer" and id == timer then
+            break
+        end
+    end
+    
+    return found
+end
+
+function TERM:connectToServer(serverId)
+    rednet.send(serverId, { 
+        action = "ks_connect",
+        termWidth = term.getSize(),
+        termHeight = select(2, term.getSize())
+    }, "ksw_term")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == serverId then
+            if msg.ks_accepted then
+                self.activeServer = {
+                    id = serverId,
+                    name = msg.name or "Server " .. serverId,
+                    buffer = {}
+                }
+                return true
+            end
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+function TERM:manualConnect()
+    write("Enter server computer ID: ")
+    local id = tonumber(read())
+    if not id then
+        print("Invalid ID")
+        return false
+    end
+    
+    print("Connecting to " .. id .. "...")
+    if self:connectToServer(id) then
+        print("Connected!")
+        return true
+    else
+        print("Connection failed")
+        return false
+    end
+end
+
+-- ============================================
+-- TERMINAL EMULATION
+-- ============================================
+
+function TERM:clearScreen()
+    term.clear()
+    term.setCursorPos(1,1)
+end
+
+function TERM:drawHeader()
+    local w, h = term.getSize()
+    term.setCursorPos(1,1)
+    term.setBackgroundColor(colors.blue)
+    term.setTextColor(colors.white)
+    
+    local header = " KSW TERMINAL v" .. self.version .. " "
+    if self.activeServer then
+        header = header .. "| " .. self.activeServer.name .. " (ID: " .. self.activeServer.id .. ") "
+    end
+    
+    -- Pad to full width
+    while #header < w do
+        header = header .. " "
+    end
+    
+    print(header:sub(1,w))
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+end
+
+function TERM:drawStatusBar(msg)
+    local w, h = term.getSize()
+    term.setCursorPos(1, h)
+    term.setBackgroundColor(colors.gray)
+    term.setTextColor(colors.white)
+    
+    local status = " " .. (msg or "F1=Servers F2=Disconnect F3=Clear Q=Quit")
+    while #status < w do
+        status = status .. " "
+    end
+    
+    term.write(status:sub(1,w))
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+end
+
+-- ============================================
+-- SERVER SELECTION MENU
+-- ============================================
+
+function TERM:serverMenu()
+    self:clearScreen()
+    print("===================================================")
+    print("  KIRITO SOFTWORKS TERMINAL")
+    print("  Select Server")
+    print("===================================================")
+    print()
+    
+    if #self.servers == 0 then
+        print("No servers found. Scanning...")
+        self:discoverServers()
+        print()
+    end
+    
+    if #self.servers == 0 then
+        print("No servers found.")
+        print()
+        print("1. Manual connect")
+        print("2. Rescan")
+        print("3. Back")
+        write("Choice: ")
+        local c = read()
+        
+        if c == "1" then
+            if self:manualConnect() then
+                return true
+            end
+        elseif c == "2" then
+            return self:serverMenu()
+        end
+        return false
+    end
+    
+    print("Available servers:")
+    for i, s in ipairs(self.servers) do
+        print("  " .. i .. ". " .. s.name .. " [" .. s.type .. "] (ID: " .. s.id .. ")")
+    end
+    print()
+    print("M. Manual connect")
+    print("R. Rescan")
+    print("Q. Quit")
+    print()
+    write("Select: ")
+    
+    local choice = read()
+    
+    if choice:lower() == "m" then
+        return self:manualConnect()
+    elseif choice:lower() == "r" then
+        self.servers = {}
+        return self:serverMenu()
+    elseif choice:lower() == "q" then
+        self.running = false
+        return false
+    end
+    
+    local num = tonumber(choice)
+    if num and num >= 1 and num <= #self.servers then
+        print("Connecting to " .. self.servers[num].name .. "...")
+        if self:connectToServer(self.servers[num].id) then
+            print("Connected!")
+            sleep(1)
+            return true
+        else
+            print("Failed to connect")
+            sleep(2)
+            return self:serverMenu()
+        end
+    end
+    
+    return false
+end
+
+-- ============================================
+-- MAIN TERMINAL LOOP
+-- ============================================
+
+function TERM:runTerminal()
+    if not self.activeServer then
+        if not self:serverMenu() then
+            return
+        end
+    end
+    
+    self:clearScreen()
+    
+    -- Request initial screen
+    rednet.send(self.activeServer.id, { action = "ks_sync" }, "ksw_term")
+    
+    local cursorX, cursorY = 1, 2
+    
+    while self.running and self.activeServer do
+        self:drawHeader()
+        self:drawStatusBar()
+        
+        -- Position cursor
+        term.setCursorPos(cursorX, cursorY)
+        
+        -- Wait for input or server message
+        local timer = os.startTimer(0.1)
+        local event = {os.pullEvent()}
+        
+        if event[1] == "rednet_message" then
+            local id, msg = event[2], event[3]
+            
+            if id == self.activeServer.id and msg then
+                -- Server sent display data
+                if msg.ks_display then
+                    -- Clear and redraw
+                    self:clearScreen()
+                    self:drawHeader()
+                    
+                    -- Draw content
+                    for i, line in ipairs(msg.ks_display) do
+                        term.setCursorPos(1, i + 1)
+                        term.write(line)
+                    end
+                    
+                    cursorX = msg.cursorX or 1
+                    cursorY = (msg.cursorY or 0) + 1
+                    
+                elseif msg.ks_print then
+                    -- Server printed something
+                    term.setCursorPos(1, cursorY)
+                    term.write(msg.ks_print)
+                    cursorY = cursorY + 1
+                    
+                elseif msg.ks_clear then
+                    self:clearScreen()
+                    cursorX, cursorY = 1, 2
+                    
+                elseif msg.ks_cursor then
+                    cursorX = msg.x or 1
+                    cursorY = (msg.y or 0) + 1
+                    
+                elseif msg.ks_disconnect then
+                    print("Server disconnected")
+                    self.activeServer = nil
+                    sleep(2)
+                    return
+                end
+            end
+            
+        elseif event[1] == "key" then
+            local key = event[2]
+            
+            -- Function keys
+            if key == keys.f1 then
+                -- Server menu
+                self.activeServer = nil
+                return self:runTerminal()
+                
+            elseif key == keys.f2 then
+                -- Disconnect
+                rednet.send(self.activeServer.id, { action = "ks_disconnect" }, "ksw_term")
+                self.activeServer = nil
+                print("Disconnected")
+                sleep(1)
+                return self:runTerminal()
+                
+            elseif key == keys.f3 then
+                -- Clear screen request
+                rednet.send(self.activeServer.id, { action = "ks_clear" }, "ksw_term")
+                
+            elseif key == keys.q then
+                -- Quit
+                self.running = false
+                rednet.send(self.activeServer.id, { action = "ks_disconnect" }, "ksw_term")
+                
+            else
+                -- Send key to server
+                rednet.send(self.activeServer.id, { 
+                    action = "ks_key",
+                    key = key,
+                    keys = keys
+                }, "ksw_term")
+            end
+            
+        elseif event[1] == "char" then
+            -- Send char to server
+            rednet.send(self.activeServer.id, { 
+                action = "ks_char",
+                char = event[2]
+            }, "ksw_term")
+            
+        elseif event[1] == "timer" and event[2] == timer then
+            -- Just a check timer, send ping
+            rednet.send(self.activeServer.id, { action = "ks_ping" }, "ksw_term")
+        end
+    end
+end
+
+-- ============================================
+-- MAIN
+-- ============================================
+
+function main()
+    term.clear()
+    term.setCursorPos(1,1)
+    
+    print("===================================================")
+    print("  KIRITO SOFTWORKS TERMINAL CLIENT v" .. TERM.version)
+    print("  Multi-Server Terminal Emulator")
+    print("===================================================")
+    print()
+    
+    if not TERM:openModem() then
+        print("ERROR: No modem found!")
+        return
+    end
+    
+    print("Modem ready")
+    print()
+    
+    while TERM.running do
+        TERM:runTerminal()
+    end
+    
+    term.clear()
+    term.setCursorPos(1,1)
+    print("Goodbye!")
+end
+
+main()
