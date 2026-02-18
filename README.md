@@ -1,10 +1,11 @@
 -- ============================================
 -- KIRITO SOFTWORKS
+-- JBOD Network Storage System v3.5 - BUG FIX
 -- For CC: Tweaked (ComputerCraft)
 -- ============================================
 
 local JBOD = {
-    version = "3.4",
+    version = "3.5",
     drives = {},
     debug = false
 }
@@ -13,16 +14,15 @@ local JBOD = {
 -- SUPPORTED PERIPHERAL TYPES
 -- ============================================
 
--- List of peripheral types that can act as storage
 JBOD.VALID_TYPES = {
-    "drive",           -- Standard CC:Tweaked disk drive
-    "disk_drive",      -- Alternative naming
-    "diskraid",        -- More Peripherals Disk Raid
-    "disk_raid",       -- Alternative naming
-    "advanced_disk_raid", -- More Peripherals Advanced Disk Raid
-    "storage",         -- Generic storage peripheral
-    "drive_bay",       -- Possible modded drive bays
-    "media_drive",     -- Other media drives
+    "drive",
+    "disk_drive", 
+    "diskraid",
+    "disk_raid",
+    "advanced_disk_raid",
+    "storage",
+    "drive_bay",
+    "media_drive",
 }
 
 function JBOD:isValidStorageType(peripheralType)
@@ -38,7 +38,7 @@ function JBOD:isValidStorageType(peripheralType)
 end
 
 -- ============================================
--- DRIVE DETECTION
+-- DRIVE DETECTION - FIXED
 -- ============================================
 
 function JBOD:scanDrives()
@@ -52,49 +52,77 @@ function JBOD:scanDrives()
         
         if self:isValidStorageType(pType) then
             local drive = peripheral.wrap(name)
-            
-            -- Check if disk/media is present
             local hasMedia = false
             
-            -- Try different methods to check for media
+            -- SAFE check for media presence
             if drive.isDiskPresent then
-                hasMedia = drive.isDiskPresent()
-            elseif drive.hasDisk then
-                hasMedia = drive.hasDisk()
-            elseif drive.isMediaPresent then
-                hasMedia = drive.isMediaPresent()
-            elseif drive.getDiskID then
-                -- If it has getDiskID, try calling it
-                local ok, result = pcall(function() return drive.getDiskID() end)
-                hasMedia = ok and result ~= nil
-            else
-                -- Assume present if we can't check (some raid blocks don't report this)
-                hasMedia = true
+                -- Wrap in pcall to prevent errors
+                local ok, result = pcall(function()
+                    return drive.isDiskPresent()
+                end)
+                if ok then
+                    hasMedia = result
+                else
+                    -- If isDiskPresent errors, assume no media or try other methods
+                    hasMedia = false
+                end
+            end
+            
+            -- If no isDiskPresent or it returned false, check other methods
+            if not hasMedia then
+                if drive.hasDisk then
+                    local ok, result = pcall(function()
+                        return drive.hasDisk()
+                    end)
+                    if ok then hasMedia = result end
+                    
+                elseif drive.isMediaPresent then
+                    local ok, result = pcall(function()
+                        return drive.isMediaPresent()
+                    end)
+                    if ok then hasMedia = result end
+                    
+                elseif drive.getDiskID then
+                    -- Try to get disk ID - if it works, media is present
+                    local ok, id = pcall(function()
+                        return drive.getDiskID()
+                    end)
+                    hasMedia = ok and id ~= nil
+                else
+                    -- No way to check - assume present for raid blocks
+                    hasMedia = true
+                end
             end
             
             if hasMedia then
-                -- Get mount path
                 local mountPath = nil
                 
+                -- SAFE getMountPath
                 if drive.getMountPath then
-                    mountPath = drive.getMountPath()
+                    local ok, result = pcall(function()
+                        return drive.getMountPath()
+                    end)
+                    if ok then mountPath = result end
                 end
                 
-                -- For raid blocks or drives without standard mount paths
-                -- we'll check if they have direct fs methods or need special handling
-                if not mountPath and drive.list then
-                    -- Some raid blocks have direct fs methods
-                    mountPath = name  -- Use peripheral name as identifier
+                -- For raid blocks without mount paths
+                if not mountPath and (drive.list or drive.getCapacity) then
+                    mountPath = name
                 end
                 
                 if mountPath or drive.list then
+                    -- SAFE get disk ID
                     local diskId = "N/A"
                     if drive.getDiskID then
-                        local ok, id = pcall(function() return drive.getDiskID() end)
-                        if ok then diskId = tostring(id) end
+                        local ok, id = pcall(function()
+                            return drive.getDiskID()
+                        end)
+                        if ok and id then diskId = tostring(id) end
                     elseif drive.getID then
-                        local ok, id = pcall(function() return drive.getID() end)
-                        if ok then diskId = tostring(id) end
+                        local ok, id = pcall(function()
+                            return drive.getID()
+                        end)
+                        if ok and id then diskId = tostring(id) end
                     end
                     
                     table.insert(self.drives, {
@@ -108,7 +136,7 @@ function JBOD:scanDrives()
                     })
                     
                     if self.debug then
-                        print("  Found: " .. name .. " [" .. pType .. "] -> " .. (mountPath or name))
+                        print("  Found: " .. name .. " [" .. pType .. "]")
                     end
                 end
             else
@@ -134,7 +162,7 @@ function JBOD:listFiles()
     for driveIndex, drive in ipairs(self.drives) do
         local p = drive.peripheral
         
-        -- Method 1: Standard mount path (regular disk drives)
+        -- Method 1: Standard mount path
         if drive.fullPath and fs.isDir(drive.fullPath) then
             for _, name in ipairs(fs.list(drive.fullPath)) do
                 local fp = drive.fullPath .. "/" .. name
@@ -151,7 +179,9 @@ function JBOD:listFiles()
             
         -- Method 2: Direct peripheral methods (raid blocks)
         elseif p.list then
-            local ok, items = pcall(function() return p.list("/") end)
+            local ok, items = pcall(function()
+                return p.list("/")
+            end)
             if ok and items then
                 for name, size in pairs(items) do
                     if type(size) == "number" then
@@ -186,7 +216,7 @@ function JBOD:read(name)
     local drive = self.drives[f.driveIndex]
     local p = drive.peripheral
     
-    -- Try method 1: Standard fs
+    -- Method 1: Standard fs
     if drive.fullPath then
         local path = drive.fullPath .. "/" .. name
         local h = fs.open(path, "r")
@@ -197,9 +227,9 @@ function JBOD:read(name)
         end
     end
     
-    -- Try method 2: Direct read
+    -- Method 2: Direct read
     if p.read then
-        local ok, data = pcall(function() 
+        local ok, data = pcall(function()
             local h = p.read(name)
             if h then
                 local d = h.readAll()
@@ -217,11 +247,9 @@ function JBOD:write(name, data)
     local existing = self:findFile(name)
     local targetDrive = nil
     
-    -- Overwrite existing
     if existing then
         targetDrive = existing.driveIndex
     else
-        -- Find drive with most space
         local bestFree = -1
         for i, d in ipairs(self.drives) do
             local free = self:getDriveFreeSpace(i)
@@ -234,14 +262,13 @@ function JBOD:write(name, data)
     
     if not targetDrive then return false, "No drives available" end
     
-    local drive = self.drives[targetDrive]
-    
-    -- Check space
     if self:getDriveFreeSpace(targetDrive) < #data then
         return false, "Not enough space"
     end
     
-    -- Try method 1: Standard fs
+    local drive = self.drives[targetDrive]
+    
+    -- Method 1: Standard fs
     if drive.fullPath then
         local path = drive.fullPath .. "/" .. name
         local h = fs.open(path, "w")
@@ -252,7 +279,7 @@ function JBOD:write(name, data)
         end
     end
     
-    -- Try method 2: Direct write
+    -- Method 2: Direct write
     if drive.peripheral.write then
         local ok = pcall(function()
             local h = drive.peripheral.write(name)
@@ -274,15 +301,15 @@ function JBOD:delete(name)
     
     local drive = self.drives[f.driveIndex]
     
-    -- Method 1: Standard fs
     if drive.fullPath then
         fs.delete(drive.fullPath .. "/" .. name)
         return true
     end
     
-    -- Method 2: Direct delete
     if drive.peripheral.delete then
-        local ok = pcall(function() drive.peripheral.delete(name) end)
+        local ok = pcall(function()
+            drive.peripheral.delete(name)
+        end)
         return ok
     end
     
@@ -299,19 +326,28 @@ function JBOD:getDriveFreeSpace(index)
     
     -- Method 1: fs.getFreeSpace
     if drive.fullPath then
-        return fs.getFreeSpace(drive.fullPath)
+        local ok, free = pcall(function()
+            return fs.getFreeSpace(drive.fullPath)
+        end)
+        if ok then return free end
     end
     
     -- Method 2: peripheral method
     if drive.peripheral.getFreeSpace then
-        local ok, free = pcall(function() return drive.peripheral.getFreeSpace() end)
+        local ok, free = pcall(function()
+            return drive.peripheral.getFreeSpace()
+        end)
         if ok then return free end
     end
     
     -- Method 3: Calculate from capacity - used
     if drive.peripheral.getCapacity and drive.peripheral.getUsedSpace then
-        local ok1, cap = pcall(function() return drive.peripheral.getCapacity() end)
-        local ok2, used = pcall(function() return drive.peripheral.getUsedSpace() end)
+        local ok1, cap = pcall(function()
+            return drive.peripheral.getCapacity()
+        end)
+        local ok2, used = pcall(function()
+            return drive.peripheral.getUsedSpace()
+        end)
         if ok1 and ok2 then return cap - used end
     end
     
@@ -323,18 +359,21 @@ function JBOD:getDriveTotalSpace(index)
     if not drive then return 0 end
     
     if drive.peripheral.getCapacity then
-        local ok, cap = pcall(function() return drive.peripheral.getCapacity() end)
+        local ok, cap = pcall(function()
+            return drive.peripheral.getCapacity()
+        end)
         if ok then return cap end
     end
     
     if fs.getCapacity and drive.fullPath then
-        local ok, cap = pcall(function() return fs.getCapacity(drive.fullPath) end)
+        local ok, cap = pcall(function()
+            return fs.getCapacity(drive.fullPath)
+        end)
         if ok then return cap end
     end
     
-    -- Default estimates
-    if drive.isRaid then return 10000000 end -- 10MB estimate for raid
-    return 2000000 -- 2MB default for floppy
+    if drive.isRaid then return 10000000 end
+    return 2000000
 end
 
 function JBOD:getPoolStats()
@@ -418,7 +457,6 @@ function JBOD:drawMainScreen()
     print("Commands: [L]ist  [R]ead  [W]rite  [D]elete  [I]nfo  [Q]uit")
 end
 
--- Drive info screen (only when requested)
 function JBOD:showDriveInfo()
     term.clear()
     term.setCursorPos(1,1)
