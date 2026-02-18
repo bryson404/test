@@ -1,0 +1,708 @@
+-- ============================================
+-- KIRITO SOFTWORKS
+-- JBOD Network Storage System v4.0 
+-- For CC: Tweaked (ComputerCraft)
+-- ============================================
+
+local JBOD = {
+    version = "4.0",
+    drives = {},
+    debug = false,
+    mountPoint = "/pool",
+    virtualFS = {} -- Virtual filesystem table
+}
+
+-- ============================================
+-- SUPPORTED PERIPHERAL TYPES
+-- ============================================
+
+JBOD.VALID_TYPES = {
+    "drive", "disk_drive", "diskraid", "disk_raid",
+    "advanced_disk_raid", "advanceddiskraid",
+    "storage", "drive_bay", "media_drive",
+}
+
+function JBOD:isValidStorageType(peripheralType)
+    if not peripheralType then return false end
+    peripheralType = peripheralType:lower()
+    for _, validType in ipairs(self.VALID_TYPES) do
+        if peripheralType:find(validType) then return true end
+    end
+    return false
+end
+
+-- ============================================
+-- DRIVE DETECTION - WITH DISK RAID SUPPORT
+-- ============================================
+
+function JBOD:scanDrives()
+    self.drives = {}
+    local peripherals = peripheral.getNames()
+    
+    print("Scanning for storage devices...")
+    
+    for _, name in ipairs(peripherals) do
+        local pType = peripheral.getType(name)
+        
+        if self:isValidStorageType(pType) then
+            local drive = peripheral.wrap(name)
+            local isRaid = pType:find("raid") ~= nil
+            
+            -- Check for media
+            local hasMedia = false
+            if isRaid then
+                -- Disk raids always have media (disks inside)
+                hasMedia = true
+            elseif drive.isDiskPresent then
+                local ok, result = pcall(function() return drive.isDiskPresent() end)
+                hasMedia = ok and result
+            else
+                hasMedia = true -- Assume present if we can't check
+            end
+            
+            if hasMedia then
+                local mountPath = nil
+                
+                -- Try getMountPath first
+                if drive.getMountPath then
+                    local ok, result = pcall(function() return drive.getMountPath() end)
+                    if ok then mountPath = result end
+                end
+                
+                -- For raids without mount paths, check individual disks
+                if not mountPath and isRaid and drive.getDisk then
+                    -- Disk raid - we'll access disks via getDisk()
+                    mountPath = name
+                end
+                
+                if not mountPath then
+                    mountPath = name
+                end
+                
+                -- Get disk ID
+                local diskId = "N/A"
+                if drive.getDiskID then
+                    local ok, id = pcall(function() return drive.getDiskID() end)
+                    if ok and id then diskId = tostring(id) end
+                end
+                
+                table.insert(self.drives, {
+                    name = name,
+                    peripheral = drive,
+                    pType = pType,
+                    mountPath = mountPath,
+                    diskId = diskId,
+                    fullPath = mountPath and ("/" .. mountPath) or nil,
+                    isRaid = isRaid
+                })
+                
+                if self.debug then
+                    print("  Found: " .. name .. " [" .. pType .. "]")
+                end
+            end
+        end
+    end
+    
+    table.sort(self.drives, function(a, b) return a.name < b.name end)
+    print("Total storage devices: " .. #self.drives)
+    return #self.drives
+end
+
+-- ============================================
+-- VIRTUAL FILESYSTEM OPERATIONS
+-- ============================================
+
+function JBOD:buildVirtualIndex()
+    -- Build index of all files across all drives
+    self.virtualFS = {}
+    
+    for driveIndex, drive in ipairs(self.drives) do
+        local files = self:getDriveFiles(driveIndex)
+        for _, file in ipairs(files) do
+            -- Map filename to drive location
+            self.virtualFS[file.name] = {
+                name = file.name,
+                size = file.size,
+                driveIndex = driveIndex,
+                driveName = drive.name
+            }
+        end
+    end
+end
+
+function JBOD:getDriveFiles(driveIndex)
+    local drive = self.drives[driveIndex]
+    local files = {}
+    local p = drive.peripheral
+    
+    if drive.isRaid and p.getDisk then
+        -- Disk Raid - iterate through disk slots
+        for i = 1, 9 do -- Max 9 disks in raid
+            local ok, disk = pcall(function() return p.getDisk(i) end)
+            if ok and disk then
+                -- Check if this slot has a disk
+                local diskPath = nil
+                
+                -- Try to get mount path from the disk
+                if disk.getMountPath then
+                    local ok2, mp = pcall(function() return disk.getMountPath() end)
+                    if ok2 and mp then
+                        diskPath = "/" .. mp
+                    end
+                end
+                
+                -- If we have a path, list files
+                if diskPath and fs.isDir(diskPath) then
+                    for _, fname in ipairs(fs.list(diskPath)) do
+                        local fpath = diskPath .. "/" .. fname
+                        if not fs.isDir(fpath) then
+                            table.insert(files, {
+                                name = fname,
+                                size = fs.getSize(fpath),
+                                slot = i,
+                                path = fpath
+                            })
+                        end
+                    end
+                end
+            end
+        end
+        
+    elseif drive.fullPath and fs.isDir(drive.fullPath) then
+        -- Standard mounted drive
+        for _, fname in ipairs(fs.list(drive.fullPath)) do
+            local fpath = drive.fullPath .. "/" .. fname
+            if not fs.isDir(fpath) then
+                table.insert(files, {
+                    name = fname,
+                    size = fs.getSize(fpath),
+                    path = fpath
+                })
+            end
+        end
+        
+    elseif p.list then
+        -- Direct peripheral listing
+        local ok, items = pcall(function() return p.list("/") end)
+        if ok and items then
+            for fname, size in pairs(items) do
+                if type(size) == "number" then
+                    table.insert(files, {
+                        name = fname,
+                        size = size
+                    })
+                end
+            end
+        end
+    end
+    
+    return files
+end
+
+-- ============================================
+-- VIRTUAL FILE OPERATIONS
+-- ============================================
+
+function JBOD:virtualExists(filename)
+    self:buildVirtualIndex()
+    return self.virtualFS[filename] ~= nil
+end
+
+function JBOD:virtualList()
+    self:buildVirtualIndex()
+    local list = {}
+    for name, info in pairs(self.virtualFS) do
+        table.insert(list, name)
+    end
+    table.sort(list)
+    return list
+end
+
+function JBOD:virtualGetSize(filename)
+    self:buildVirtualIndex()
+    local info = self.virtualFS[filename]
+    return info and info.size or 0
+end
+
+function JBOD:virtualRead(filename)
+    self:buildVirtualIndex()
+    local info = self.virtualFS[filename]
+    if not info then return nil, "File not found" end
+    
+    local drive = self.drives[info.driveIndex]
+    
+    -- Try to read from the actual location
+    if drive.isRaid and drive.peripheral.getDisk then
+        -- Find which slot has this file
+        for i = 1, 9 do
+            local ok, disk = pcall(function() return drive.peripheral.getDisk(i) end)
+            if ok and disk and disk.getMountPath then
+                local ok2, mp = pcall(function() return disk.getMountPath() end)
+                if ok2 and mp then
+                    local path = "/" .. mp .. "/" .. filename
+                    if fs.exists(path) and not fs.isDir(path) then
+                        local h = fs.open(path, "r")
+                        if h then
+                            local data = h.readAll()
+                            h.close()
+                            return data
+                        end
+                    end
+                end
+            end
+        end
+    else
+        -- Standard read
+        local path = drive.fullPath .. "/" .. filename
+        if fs.exists(path) then
+            local h = fs.open(path, "r")
+            if h then
+                local data = h.readAll()
+                h.close()
+                return data
+            end
+        end
+    end
+    
+    return nil, "Read failed"
+end
+
+function JBOD:virtualWrite(filename, data)
+    -- Check if exists (overwrite on same drive)
+    self:buildVirtualIndex()
+    local existing = self.virtualFS[filename]
+    local targetDrive = nil
+    
+    if existing then
+        targetDrive = existing.driveIndex
+    else
+        -- Find drive with most space
+        local bestFree = -1
+        for i, d in ipairs(self.drives) do
+            local free = self:getDriveFreeSpace(i)
+            if free > bestFree then
+                bestFree = free
+                targetDrive = i
+            end
+        end
+    end
+    
+    if not targetDrive then return false, "No drives available" end
+    
+    local drive = self.drives[targetDrive]
+    
+    -- Check space
+    if self:getDriveFreeSpace(targetDrive) < #data then
+        return false, "Not enough space"
+    end
+    
+    -- Write to the drive
+    if drive.isRaid and drive.peripheral.getDisk then
+        -- Find a slot with space
+        for i = 1, 9 do
+            local ok, disk = pcall(function() return drive.peripheral.getDisk(i) end)
+            if ok and disk then
+                local ok2, mp = pcall(function() return disk.getMountPath() end)
+                if ok2 and mp then
+                    local path = "/" .. mp .. "/" .. filename
+                    -- Check if file exists here or if there's space
+                    local h = fs.open(path, "w")
+                    if h then
+                        h.write(data)
+                        h.close()
+                        return true
+                    end
+                end
+            end
+        end
+    else
+        -- Standard write
+        local path = drive.fullPath .. "/" .. filename
+        local h = fs.open(path, "w")
+        if h then
+            h.write(data)
+            h.close()
+            return true
+        end
+    end
+    
+    return false, "Write failed"
+end
+
+function JBOD:virtualDelete(filename)
+    self:buildVirtualIndex()
+    local info = self.virtualFS[filename]
+    if not info then return false, "File not found" end
+    
+    local drive = self.drives[info.driveIndex]
+    
+    if drive.isRaid and drive.peripheral.getDisk then
+        for i = 1, 9 do
+            local ok, disk = pcall(function() return drive.peripheral.getDisk(i) end)
+            if ok and disk then
+                local ok2, mp = pcall(function() return disk.getMountPath() end)
+                if ok2 and mp then
+                    local path = "/" .. mp .. "/" .. filename
+                    if fs.exists(path) then
+                        fs.delete(path)
+                        return true
+                    end
+                end
+            end
+        end
+    else
+        local path = drive.fullPath .. "/" .. filename
+        if fs.exists(path) then
+            fs.delete(path)
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- ============================================
+-- CREATE VIRTUAL MOUNT POINT
+-- ============================================
+
+function JBOD:createVirtualMount()
+    -- Create mount point directory if it doesn't exist
+    if not fs.exists(self.mountPoint) then
+        fs.makeDir(self.mountPoint)
+    end
+    
+    -- We can't truly mount a virtual FS in CC:Tweaked, but we can:
+    -- 1. Sync files to the mount point (mirror mode)
+    -- 2. Provide wrapper functions that intercept fs calls
+    
+    -- For now, let's create a "live mirror" that updates the mount point
+    self:syncToMount()
+end
+
+function JBOD:syncToMount()
+    -- Clear and rebuild the mount point
+    if fs.exists(self.mountPoint) then
+        -- Remove old files (but keep the directory)
+        for _, fname in ipairs(fs.list(self.mountPoint)) do
+            fs.delete(self.mountPoint .. "/" .. fname)
+        end
+    else
+        fs.makeDir(self.mountPoint)
+    end
+    
+    -- Copy current files to mount point
+    self:buildVirtualIndex()
+    for fname, info in pairs(self.virtualFS) do
+        local data, err = self:virtualRead(fname)
+        if data then
+            local h = fs.open(self.mountPoint .. "/" .. fname, "w")
+            if h then
+                h.write(data)
+                h.close()
+            end
+        end
+    end
+end
+
+-- ============================================
+-- SPACE CALCULATION
+-- ============================================
+
+function JBOD:getDriveFreeSpace(index)
+    local drive = self.drives[index]
+    if not drive then return 0 end
+    
+    if drive.isRaid and drive.peripheral.getDisk then
+        -- Sum free space across all disks in raid
+        local totalFree = 0
+        for i = 1, 9 do
+            local ok, disk = pcall(function() return drive.peripheral.getDisk(i) end)
+            if ok and disk then
+                if disk.getMountPath then
+                    local ok2, mp = pcall(function() return disk.getMountPath() end)
+                    if ok2 and mp then
+                        totalFree = totalFree + fs.getFreeSpace("/" .. mp)
+                    end
+                end
+            end
+        end
+        return totalFree
+    elseif drive.fullPath then
+        local ok, free = pcall(function() return fs.getFreeSpace(drive.fullPath) end)
+        if ok then return free end
+    end
+    
+    return 0
+end
+
+function JBOD:getDriveTotalSpace(index)
+    local drive = self.drives[index]
+    if not drive then return 0 end
+    
+    if drive.isRaid and drive.peripheral.getDisk then
+        local total = 0
+        for i = 1, 9 do
+            local ok, disk = pcall(function() return drive.peripheral.getDisk(i) end)
+            if ok and disk then
+                if disk.getMountPath then
+                    local ok2, mp = pcall(function() return disk.getMountPath() end)
+                    if ok2 and mp then
+                        local path = "/" .. mp
+                        if fs.getCapacity then
+                            local ok3, cap = pcall(function() return fs.getCapacity(path) end)
+                            if ok3 then total = total + cap end
+                        else
+                            total = total + 2000000 -- Assume 2MB per disk
+                        end
+                    end
+                end
+            end
+        end
+        return total
+    elseif drive.fullPath and fs.getCapacity then
+        local ok, cap = pcall(function() return fs.getCapacity(drive.fullPath) end)
+        if ok then return cap end
+    end
+    
+    return 2000000 -- Default
+end
+
+function JBOD:getPoolStats()
+    local total, free = 0, 0
+    for i = 1, #self.drives do
+        total = total + self:getDriveTotalSpace(i)
+        free = free + self:getDriveFreeSpace(i)
+    end
+    local used = total - free
+    local percent = total > 0 and math.floor((used / total) * 100) or 0
+    return { total = total, used = used, free = free, percent = percent, drives = #self.drives }
+end
+
+-- ============================================
+-- USER INTERFACE
+-- ============================================
+
+function JBOD:formatBytes(b)
+    if b >= 1000000000 then return string.format("%.2f GB", b/1000000000)
+    elseif b >= 1000000 then return string.format("%.2f MB", b/1000000)
+    elseif b >= 1000 then return string.format("%.2f KB", b/1000)
+    else return b .. " B" end
+end
+
+function JBOD:drawBar(pct, w)
+    local filled = math.floor((pct/100) * w)
+    return "[" .. string.rep("=", filled) .. string.rep("-", w-filled) .. "]"
+end
+
+function JBOD:drawHeader()
+    print("===================================================")
+    print("           KIRITO SOFTWORKS PRESENTS")
+    print("===================================================")
+    print()
+end
+
+function JBOD:drawMainScreen()
+    term.clear()
+    term.setCursorPos(1,1)
+    self:drawHeader()
+    
+    local s = self:getPoolStats()
+    
+    print("JBOD NETWORK STORAGE POOL")
+    print("Mount: " .. self.mountPoint)
+    print("---------------------------------------------------")
+    print(string.format("  Devices: %d", s.drives))
+    print(string.format("  %s %d%%", self:drawBar(s.percent, 30), s.percent))
+    print(string.format("  Used:  %s", self:formatBytes(s.used)))
+    print(string.format("  Free:  %s", self:formatBytes(s.free)))
+    print(string.format("  Total: %s", self:formatBytes(s.total)))
+    print("---------------------------------------------------")
+    
+    local files = self:virtualList()
+    print("FILES (" .. #files .. " total):")
+    if #files == 0 then
+        print("  (pool empty)")
+    else
+        for i = 1, math.min(8, #files) do
+            local size = self:virtualGetSize(files[i])
+            print(string.format("  %-20s %s", files[i]:sub(1,20), self:formatBytes(size)))
+        end
+        if #files > 8 then print("  ... +" .. (#files-8) .. " more") end
+    end
+    
+    print()
+    print("Commands: [L]ist  [R]ead  [W]rite  [D]elete  [S]ync  [I]nfo  [Q]uit")
+end
+
+function JBOD:showDriveInfo()
+    term.clear()
+    term.setCursorPos(1,1)
+    self:drawHeader()
+    print("STORAGE DEVICES")
+    print("===================================================")
+    print()
+    
+    for i, d in ipairs(self.drives) do
+        local total = self:getDriveTotalSpace(i)
+        local free = self:getDriveFreeSpace(i)
+        local used = total - free
+        local pct = total > 0 and math.floor((used/total)*100) or 0
+        
+        print(string.format("[%d] %s", i, d.name))
+        print(string.format("    Type: %s%s", d.pType, d.isRaid and " [RAID]" or ""))
+        print(string.format("    ID: %s", d.diskId))
+        print(string.format("    %s %d%%", self:drawBar(pct, 20), pct))
+        print(string.format("    %s / %s", self:formatBytes(used), self:formatBytes(total)))
+        print()
+    end
+    
+    print("Press Enter...")
+    read()
+end
+
+-- ============================================
+-- INTERACTIVE SHELL
+-- ============================================
+
+function JBOD:run()
+    self:scanDrives()
+    self:createVirtualMount()
+    
+    while true do
+        self:drawMainScreen()
+        
+        term.setCursorPos(1, 22)
+        write("> ")
+        local cmd = read():lower():sub(1,1)
+        
+        if cmd == "q" then
+            print("Goodbye!")
+            break
+            
+        elseif cmd == "s" then
+            print("Syncing to " .. self.mountPoint .. "...")
+            self:syncToMount()
+            print("Done!")
+            sleep(1)
+            
+        elseif cmd == "i" then
+            self:showDriveInfo()
+            
+        elseif cmd == "l" then
+            print("\nAll files in pool:")
+            for _, fname in ipairs(self:virtualList()) do
+                local size = self:virtualGetSize(fname)
+                print(string.format("  %-25s %s", fname, self:formatBytes(size)))
+            end
+            print("\nPress Enter...")
+            read()
+            
+        elseif cmd == "r" then
+            write("File to read: ")
+            local name = read()
+            write("Save as: ")
+            local dest = read()
+            
+            local data, err = self:virtualRead(name)
+            if data then
+                local h = fs.open(dest, "w")
+                if h then h.write(data) h.close() print("Saved!") end
+            else
+                print("Error: " .. tostring(err))
+            end
+            sleep(1)
+            
+        elseif cmd == "w" then
+            write("Local file: ")
+            local src = read()
+            if fs.exists(src) and not fs.isDir(src) then
+                local h = fs.open(src, "r")
+                local data = h.readAll()
+                h.close()
+                
+                write("Save as: ")
+                local name = read()
+                if name == "" then name = fs.getName(src) end
+                
+                local ok, err = self:virtualWrite(name, data)
+                if ok then
+                    -- Also sync to mount point
+                    self:syncToMount()
+                    print("Saved!")
+                else
+                    print("Failed: " .. tostring(err))
+                end
+            else
+                print("File not found")
+            end
+            sleep(1)
+            
+        elseif cmd == "d" then
+            write("File to delete: ")
+            local name = read()
+            write("Confirm (yes): ")
+            if read():lower() == "yes" then
+                if self:virtualDelete(name) then
+                    self:syncToMount()
+                    print("Deleted")
+                else
+                    print("Failed")
+                end
+            end
+            sleep(1)
+        end
+    end
+end
+
+-- ============================================
+-- NETWORK/REMOTE ACCESS
+-- ============================================
+
+function JBOD:startServer()
+    -- Host the JBOD as a network share
+    rednet.open("back") -- or whatever side has modem
+    
+    print("JBOD Network Server started on " .. os.getComputerID())
+    
+    while true do
+        local id, msg = rednet.receive("jbod")
+        if msg and msg.action then
+            if msg.action == "list" then
+                rednet.send(id, { files = self:virtualList() }, "jbod")
+            elseif msg.action == "read" and msg.file then
+                local data = self:virtualRead(msg.file)
+                rednet.send(id, { data = data }, "jbod")
+            elseif msg.action == "write" and msg.file and msg.data then
+                local ok, err = self:virtualWrite(msg.file, msg.data)
+                if ok then self:syncToMount() end
+                rednet.send(id, { success = ok, error = err }, "jbod")
+            elseif msg.action == "stats" then
+                rednet.send(id, { stats = self:getPoolStats() }, "jbod")
+            end
+        end
+    end
+end
+
+-- ============================================
+-- MAIN
+-- ============================================
+
+local args = {...}
+if args[1] == "server" then
+    JBOD:scanDrives()
+    JBOD:createVirtualMount()
+    JBOD:startServer()
+elseif args[1] == "api" then
+    JBOD:scanDrives()
+    _G.JBOD = {
+        list = function() return JBOD:virtualList() end,
+        read = function(n) return JBOD:virtualRead(n) end,
+        write = function(n,d) return JBOD:virtualWrite(n,d) end,
+        delete = function(n) return JBOD:virtualDelete(n) end,
+        sync = function() return JBOD:syncToMount() end,
+        stats = function() return JBOD:getPoolStats() end,
+    }
+    print("KIRITO SOFTWORKS JBOD API ready")
+else
+    JBOD:run()
+end
