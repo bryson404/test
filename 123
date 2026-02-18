@@ -1,11 +1,11 @@
 -- ============================================
--- KIRITO SOFTWORKS JBOD NFS SERVER v5.1
+-- KIRITO SOFTWORKS JBOD NFS SERVER v6.0
 -- Complete Network File System Server
--- Supports multiple drives, remote execution, and stats
+-- Supports: file storage, remote execution, stats, and transparent disk clients
 -- ============================================
 
 local JBOD = {
-    version = "5.1",
+    version = "6.0",
     drives = {},
     clients = {},
     accessLog = {},
@@ -270,7 +270,7 @@ function JBOD:getStats()
                     local ok2, mp = pcall(function() return disk.getMountPath() end)
                     if ok2 and mp then
                         local path = "/" .. mp
-                        local cap = 2000000 -- Default 2MB
+                        local cap = 2000000
                         if fs.getCapacity then
                             local ok3, c = pcall(function() return fs.getCapacity(path) end)
                             if ok3 then cap = c end
@@ -372,11 +372,32 @@ function JBOD:handleRequest()
                             error = "File not found"
                         }, "jbod")
                     end
+                    
+                -- EXISTS (for transparent disk client)
+                elseif msg.action == "exists" and msg.path then
+                    local exists = self:findFile(msg.path) ~= nil
+                    rednet.send(id, { exists = exists }, "jbod")
+                    
+                -- ISDIR (for transparent disk client - JBOD is flat)
+                elseif msg.action == "isdir" and msg.path then
+                    -- Root is considered a directory, files are not
+                    local isdir = (msg.path == "/" or msg.path == "")
+                    rednet.send(id, { isdir = isdir }, "jbod")
+                    
+                -- GETSIZE (for transparent disk client)
+                elseif msg.action == "getsize" and msg.path then
+                    local file = self:findFile(msg.path)
+                    rednet.send(id, { size = file and file.size or 0 }, "jbod")
+                    
+                -- MKDIR (for transparent disk client - JBOD is flat, so just return success)
+                elseif msg.action == "mkdir" and msg.path then
+                    rednet.send(id, { success = true }, "jbod")
+                    
                 end
             end
             
         elseif event[1] == "timer" and event[2] == timer then
-            -- Just the check timer, continue
+            -- Check timer, continue loop
             
         elseif event[1] == "key" then
             if event[2] == keys.q then
@@ -397,7 +418,7 @@ function main()
     
     print("===================================================")
     print("  KIRITO SOFTWORKS JBOD NFS SERVER v" .. JBOD.version)
-    print("  Network File System - Remote Execution Enabled")
+    print("  Network File System - Transparent Disk Enabled")
     print("===================================================")
     print()
     
@@ -407,9 +428,10 @@ function main()
         return
     end
     
-    JBOD:scanDrives()
+    print("Scanning drives...")
+    local count = JBOD:scanDrives()
     
-    if #JBOD.drives == 0 then
+    if count == 0 then
         print()
         print("WARNING: No drives found!")
         print("Insert disks and press any key to retry...")
