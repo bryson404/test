@@ -1,561 +1,354 @@
 -- ============================================
--- KIRTIO SOFTWORKS
+-- Kirtio SoftWorks
 -- For CC: Tweaked (ComputerCraft)
+
 -- ============================================
 
 local JBOD = {
-    version = "3.2",
+    version = "3.3",
     drives = {},
-    mountPoint = "/jbod",
-    debug = true
+    debug = false
 }
 
 -- ============================================
--- DRIVE DETECTION & MOUNT PATHS
+-- DRIVE MANAGEMENT
 -- ============================================
 
 function JBOD:scanDrives()
     self.drives = {}
     local peripherals = peripheral.getNames()
     
-    print("Scanning for drives...")
-    
     for _, name in ipairs(peripherals) do
-        local pType = peripheral.getType(name)
-        
-        -- Check if it's a drive peripheral
-        if pType == "drive" then
+        if peripheral.getType(name) == "drive" then
             local drive = peripheral.wrap(name)
-            
-            -- Check if there's actually a disk/media in the drive
-            local hasDisk = false
-            if drive.isDiskPresent then
-                hasDisk = drive.isDiskPresent()
-            end
-            
-            if hasDisk then
-                -- Get the mount path (e.g., "disk", "disk1")
-                local mountPath = nil
-                if drive.getMountPath then
-                    mountPath = drive.getMountPath()
-                end
-                
+            if drive.isDiskPresent and drive.isDiskPresent() then
+                local mountPath = drive.getMountPath and drive.getMountPath()
                 if mountPath then
-                    -- Get disk info
-                    local diskId = ""
-                    if drive.getDiskID then
-                        diskId = tostring(drive.getDiskID())
-                    end
-                    
-                    -- Check if it's a floppy or other media
-                    local isFloppy = false
-                    if drive.hasData then
-                        isFloppy = drive.hasData()
-                    end
-                    
                     table.insert(self.drives, {
                         name = name,
                         peripheral = drive,
                         mountPath = mountPath,
-                        diskId = diskId,
-                        isFloppy = isFloppy,
+                        diskId = drive.getDiskID and drive.getDiskID() or 0,
                         fullPath = "/" .. mountPath
                     })
-                    
-                    if self.debug then
-                        print("  Found: " .. name .. " -> " .. mountPath .. " (ID: " .. diskId .. ")")
-                    end
-                else
-                    if self.debug then
-                        print("  Warning: " .. name .. " has disk but no mount path")
-                    end
-                end
-            else
-                if self.debug then
-                    print("  " .. name .. " - no disk inserted")
                 end
             end
         end
     end
     
-    -- Sort by mount path for consistent ordering
     table.sort(self.drives, function(a, b) return a.mountPath < b.mountPath end)
-    
-    print("Total drives mounted: " .. #self.drives)
     return #self.drives
 end
 
--- ============================================
--- FILE OPERATIONS (Using fs API on mount paths)
--- ============================================
-
-function JBOD:listFiles()
-    local allFiles = {}
+function JBOD:getPoolStats()
+    local total, used, free = 0, 0, 0
     
-    for driveIndex, drive in ipairs(self.drives) do
+    for i, drive in ipairs(self.drives) do
         local path = drive.fullPath
-        
-        -- Check if path exists and is directory
         if fs.isDir(path) then
-            local files = fs.list(path)
-            for _, filename in ipairs(files) do
-                local filePath = path .. "/" .. filename
-                local size = 0
-                if not fs.isDir(filePath) then
-                    size = fs.getSize(filePath)
-                end
-                
-                table.insert(allFiles, {
-                    name = filename,
-                    size = size,
-                    driveIndex = driveIndex,
-                    driveName = drive.name,
-                    drivePath = drive.mountPath,
-                    fullPath = filePath,
-                    isDir = fs.isDir(filePath)
-                })
-            end
+            local cap = fs.getCapacity and fs.getCapacity(path) or 2000000
+            local avail = fs.getFreeSpace(path)
+            total = total + cap
+            free = free + avail
         end
     end
     
-    -- Sort by filename
-    table.sort(allFiles, function(a, b) return a.name:lower() < b.name:lower() end)
+    used = total - free
+    local percent = total > 0 and math.floor((used / total) * 100) or 0
     
-    return allFiles
+    return {
+        total = total,
+        used = used,
+        free = free,
+        percent = percent,
+        drives = #self.drives
+    }
 end
 
-function JBOD:findFile(filename)
-    local files = self:listFiles()
-    for _, file in ipairs(files) do
-        if file.name == filename then
-            return file
+-- ============================================
+-- FILE OPERATIONS
+-- ============================================
+
+function JBOD:listFiles()
+    local files = {}
+    for driveIndex, drive in ipairs(self.drives) do
+        local path = drive.fullPath
+        if fs.isDir(path) then
+            for _, name in ipairs(fs.list(path)) do
+                local fp = path .. "/" .. name
+                if not fs.isDir(fp) then
+                    table.insert(files, {
+                        name = name,
+                        size = fs.getSize(fp),
+                        drive = drive.mountPath
+                    })
+                end
+            end
         end
+    end
+    table.sort(files, function(a, b) return a.name:lower() < b.name:lower() end)
+    return files
+end
+
+function JBOD:findFile(name)
+    for _, f in ipairs(self:listFiles()) do
+        if f.name == name then return f end
     end
     return nil
 end
 
-function JBOD:readFile(filename)
-    local file = self:findFile(filename)
-    if not file then
-        return nil, "File not found: " .. filename
+function JBOD:read(name)
+    local f = self:findFile(name)
+    if not f then return nil, "Not found" end
+    for _, d in ipairs(self.drives) do
+        if d.mountPath == f.drive then
+            local h = fs.open(d.fullPath .. "/" .. name, "r")
+            if h then
+                local data = h.readAll()
+                h.close()
+                return data
+            end
+        end
     end
-    
-    if file.isDir then
-        return nil, "Is a directory"
-    end
-    
-    -- Open and read using standard fs
-    local handle = fs.open(file.fullPath, "r")
-    if not handle then
-        return nil, "Cannot open file"
-    end
-    
-    local data = handle.readAll()
-    handle.close()
-    
-    return data, file
+    return nil, "Read failed"
 end
 
-function JBOD:writeFile(filename, data, targetDriveIndex)
-    -- If file exists, overwrite on same drive
-    local existing = self:findFile(filename)
+function JBOD:write(name, data)
+    -- Check if exists (overwrite same drive)
+    local existing = self:findFile(name)
+    local targetDrive = nil
+    
     if existing then
-        targetDriveIndex = existing.driveIndex
-        if self.debug then
-            print("Overwriting on drive " .. targetDriveIndex)
+        for i, d in ipairs(self.drives) do
+            if d.mountPath == existing.drive then
+                targetDrive = i
+                break
+            end
         end
-    end
-    
-    -- If no target specified, find drive with most space
-    if not targetDriveIndex then
-        targetDriveIndex = self:findBestDrive(#data)
-        if not targetDriveIndex then
-            return false, "No drives with sufficient space"
-        end
-    end
-    
-    local drive = self.drives[targetDriveIndex]
-    if not drive then
-        return false, "Invalid drive index"
-    end
-    
-    -- Check space
-    local freeSpace = fs.getFreeSpace(drive.fullPath)
-    if freeSpace < #data then
-        return false, "Not enough space on " .. drive.mountPath .. " (need " .. #data .. ", have " .. freeSpace .. ")"
-    end
-    
-    -- Write file
-    local filePath = drive.fullPath .. "/" .. filename
-    local handle = fs.open(filePath, "w")
-    if not handle then
-        return false, "Cannot create file"
-    end
-    
-    handle.write(data)
-    handle.close()
-    
-    if self.debug then
-        print("Wrote " .. #data .. " bytes to " .. filePath)
-    end
-    
-    return true, targetDriveIndex
-end
-
-function JBOD:deleteFile(filename)
-    local file = self:findFile(filename)
-    if not file then
-        return false, "File not found"
-    end
-    
-    fs.delete(file.fullPath)
-    return true
-end
-
-function JBOD:moveFile(source, dest)
-    local data, err = self:readFile(source)
-    if not data then
-        return false, err
-    end
-    
-    local ok, err2 = self:writeFile(dest, data)
-    if not ok then
-        return false, err2
-    end
-    
-    self:deleteFile(source)
-    return true
-end
-
--- ============================================
--- SPACE MANAGEMENT - TOTAL POOL STATS
--- ============================================
-
-function JBOD:getDriveStats(driveIndex)
-    local drive = self.drives[driveIndex]
-    if not drive then return nil end
-    
-    local total = fs.getCapacity and fs.getCapacity(drive.fullPath) or 2000000 -- Default 2MB for floppies
-    local free = fs.getFreeSpace(drive.fullPath)
-    local used = total - free
-    
-    return {
-        total = total,
-        free = free,
-        used = used,
-        percent = math.floor((used / total) * 100)
-    }
-end
-
--- NEW: Get total pool stats across ALL drives
-function JBOD:getTotalPoolStats()
-    local totalSpace = 0
-    local totalFree = 0
-    
-    for i, drive in ipairs(self.drives) do
-        local stats = self:getDriveStats(i)
-        if stats then
-            totalSpace = totalSpace + stats.total
-            totalFree = totalFree + stats.free
-        end
-    end
-    
-    local totalUsed = totalSpace - totalFree
-    local percent = 0
-    if totalSpace > 0 then
-        percent = math.floor((totalUsed / totalSpace) * 100)
-    end
-    
-    return {
-        total = totalSpace,
-        free = totalFree,
-        used = totalUsed,
-        percent = percent,
-        driveCount = #self.drives
-    }
-end
-
-function JBOD:findBestDrive(sizeNeeded)
-    local bestIndex = nil
-    local mostFree = -1
-    
-    for i, drive in ipairs(self.drives) do
-        local free = fs.getFreeSpace(drive.fullPath)
-        if free >= sizeNeeded and free > mostFree then
-            mostFree = free
-            bestIndex = i
-        end
-    end
-    
-    return bestIndex
-end
-
--- ============================================
--- USER INTERFACE - TOTAL POOL DISPLAY
--- ============================================
-
-function JBOD:formatBytes(bytes)
-    if bytes >= 1000000000 then
-        return string.format("%.2f GB", bytes / 1000000000)
-    elseif bytes >= 1000000 then
-        return string.format("%.2f MB", bytes / 1000000)
-    elseif bytes >= 1000 then
-        return string.format("%.2f KB", bytes / 1000)
     else
-        return bytes .. " B"
-    end
-end
-
--- Simple ASCII progress bar
-function JBOD:drawBar(percent, width)
-    local filled = math.floor((percent / 100) * width)
-    filled = math.max(0, math.min(filled, width))
-    local bar = string.rep("=", filled) .. string.rep("-", width - filled)
-    return "[" .. bar .. "]"
-end
-
-function JBOD:drawInterface()
-    term.clear()
-    term.setCursorPos(1, 1)
-    
-    -- Header
-    print("===================================================")
-    print("     KIRITO SOFTWORKS v" .. self.version)
-    print("===================================================")
-    print()
-    
-    -- Get TOTAL POOL stats (not individual drives)
-    local pool = self:getTotalPoolStats()
-    
-    -- BIG TOTAL POOL BAR at the top
-    print("TOTAL POOL USAGE:")
-    print(string.rep("-", 50))
-    print(string.format("Drives: %d  |  %s %d%%", 
-        pool.driveCount,
-        self:drawBar(pool.percent, 25),
-        pool.percent
-    ))
-    print(string.format("Used:  %s / %s", 
-        self:formatBytes(pool.used),
-        self:formatBytes(pool.total)
-    ))
-    print(string.format("Free:  %s", 
-        self:formatBytes(pool.free)
-    ))
-    print(string.rep("-", 50))
-    print()
-    
-    -- Individual drives listed simply (no bars, just info)
-    print("DRIVE DETAILS:")
-    for i, drive in ipairs(self.drives) do
-        local stats = self:getDriveStats(i)
-        if stats then
-            -- Simple text display instead of progress bars
-            print(string.format("[%d] %-8s ID:%-3s %s / %s free", 
-                i,
-                drive.mountPath,
-                drive.diskId,
-                self:formatBytes(stats.used),
-                self:formatBytes(stats.free)
-            ))
+        -- Find drive with most space
+        local bestFree = -1
+        for i, d in ipairs(self.drives) do
+            local free = fs.getFreeSpace(d.fullPath)
+            if free > bestFree then
+                bestFree = free
+                targetDrive = i
+            end
         end
     end
+    
+    if not targetDrive then return false, "No drives" end
+    
+    local d = self.drives[targetDrive]
+    if fs.getFreeSpace(d.fullPath) < #data then
+        return false, "Not enough space"
+    end
+    
+    local h = fs.open(d.fullPath .. "/" .. name, "w")
+    if not h then return false, "Cannot create" end
+    h.write(data)
+    h.close()
+    return true
+end
+
+function JBOD:delete(name)
+    local f = self:findFile(name)
+    if not f then return false, "Not found" end
+    for _, d in ipairs(self.drives) do
+        if d.mountPath == f.drive then
+            fs.delete(d.fullPath .. "/" .. name)
+            return true
+        end
+    end
+    return false
+end
+
+-- ============================================
+-- DISPLAY & UI
+-- ============================================
+
+function JBOD:formatBytes(b)
+    if b >= 1000000 then return string.format("%.2f MB", b/1000000)
+    elseif b >= 1000 then return string.format("%.2f KB", b/1000)
+    else return b .. " B" end
+end
+
+function JBOD:drawBar(pct, w)
+    local filled = math.floor((pct/100) * w)
+    return "[" .. string.rep("=", filled) .. string.rep("-", w-filled) .. "]"
+end
+
+-- MAIN DISPLAY - Total Pool Only
+function JBOD:drawMainScreen()
+    term.clear()
+    term.setCursorPos(1,1)
+    
+    local s = self:getPoolStats()
+    
+    print("===================================================")
+    print("     JBOD POOL STORAGE")
+    print("===================================================")
+    print()
+    print(string.format("  Drives: %d", s.drives))
+    print()
+    print(string.format("  %s %d%%", self:drawBar(s.percent, 30), s.percent))
+    print()
+    print(string.format("  Used:  %s", self:formatBytes(s.used)))
+    print(string.format("  Free:  %s", self:formatBytes(s.free)))
+    print(string.format("  Total: %s", self:formatBytes(s.total)))
+    print()
+    print("===================================================")
+    print()
+    
+    -- Show files
+    local files = self:listFiles()
+    print("FILES (" .. #files .. " total):")
+    if #files == 0 then
+        print("  (pool empty)")
+    else
+        for i = 1, math.min(8, #files) do
+            local f = files[i]
+            print(string.format("  %-20s %s", f.name:sub(1,20), self:formatBytes(f.size)))
+        end
+        if #files > 8 then print("  ... +" .. (#files-8) .. " more") end
+    end
+    
+    print()
+    print("Commands: [L]ist  [R]ead  [W]rite  [D]elete  [I]nfo  [Q]uit")
+end
+
+-- DRIVE INFO SCREEN - Only when requested
+function JBOD:showDriveInfo()
+    term.clear()
+    term.setCursorPos(1,1)
+    
+    print("===================================================")
+    print("     INDIVIDUAL DRIVE INFORMATION")
+    print("===================================================")
+    print()
     
     if #self.drives == 0 then
-        print("  No drives detected!")
-        print("  Insert disks and press S to scan")
-    end
-    
-    print()
-    print(string.rep("-", 50))
-    
-    -- File List
-    print("FILES IN POOL:")
-    local files = self:listFiles()
-    if #files == 0 then
-        print("  (empty)")
+        print("No drives detected!")
     else
-        for i = 1, math.min(10, #files) do
-            local f = files[i]
-            local sizeStr = f.isDir and "<DIR>" or self:formatBytes(f.size)
-            print(string.format("  %-22s %10s  [%s]", 
-                f.name:sub(1,22), 
-                sizeStr,
-                f.drivePath
-            ))
-        end
-        if #files > 10 then
-            print("  ... and " .. (#files - 10) .. " more")
+        for i, d in ipairs(self.drives) do
+            local cap = fs.getCapacity and fs.getCapacity(d.fullPath) or 2000000
+            local free = fs.getFreeSpace(d.fullPath)
+            local used = cap - free
+            local pct = math.floor((used/cap)*100)
+            
+            print(string.format("[%d] %s (ID:%s)", i, d.mountPath, d.diskId))
+            print(string.format("    %s %d%%", self:drawBar(pct, 20), pct))
+            print(string.format("    %s / %s used, %s free", 
+                self:formatBytes(used), self:formatBytes(cap), self:formatBytes(free)))
+            print()
         end
     end
     
-    print()
-    print("Commands: [L]ist  [R]ead  [W]rite  [D]elete  [M]ove  [S]can  [Q]uit")
+    print("===================================================")
+    print("Press Enter to return...")
+    read()
 end
 
-function JBOD:interactiveShell()
+-- ============================================
+-- INTERACTIVE SHELL
+-- ============================================
+
+function JBOD:run()
     self:scanDrives()
     
     while true do
-        self:drawInterface()
+        self:drawMainScreen()
         
-        term.setCursorPos(1, 24)
+        term.setCursorPos(1, 20)
         write("> ")
-        
-        local input = read():lower()
-        local cmd = input:sub(1, 1)
+        local cmd = read():lower():sub(1,1)
         
         if cmd == "q" then
             print("Goodbye!")
             break
             
-        elseif cmd == "s" then
-            print("Scanning...")
-            self:scanDrives()
-            sleep(0.5)
+        elseif cmd == "i" then
+            self:showDriveInfo()
             
         elseif cmd == "l" then
-            print("\nAll Files in Pool:")
-            local files = self:listFiles()
-            for _, f in ipairs(files) do
-                local sizeStr = f.isDir and "<DIR>" or self:formatBytes(f.size)
-                print(string.format("  %-25s %10s  %s", 
-                    f.name, sizeStr, f.drivePath
-                ))
+            print("\nAll files:")
+            for _, f in ipairs(self:listFiles()) do
+                print(string.format("  %-25s %10s  [%s]", f.name, self:formatBytes(f.size), f.drive))
             end
-            print("\nPress Enter to continue...")
+            print("\nPress Enter...")
             read()
             
         elseif cmd == "r" then
-            write("Filename to read: ")
+            write("File to read: ")
             local name = read()
-            write("Save as (or 'print'): ")
+            write("Save as: ")
             local dest = read()
             
-            local data, info = self:readFile(name)
+            local data, err = self:read(name)
             if data then
-                if dest == "print" then
-                    print("\n--- Content ---")
-                    print(data)
-                    print("--- End ---")
+                local h = fs.open(dest, "w")
+                if h then
+                    h.write(data)
+                    h.close()
+                    print("Saved to " .. dest)
                 else
-                    local f = fs.open(dest, "w")
-                    if f then
-                        f.write(data)
-                        f.close()
-                        print("Saved to " .. dest)
-                    else
-                        print("Failed to save locally")
-                    end
+                    print("Save failed")
                 end
             else
-                print("Error: " .. tostring(info))
+                print("Error: " .. tostring(err))
             end
             sleep(1)
             
         elseif cmd == "w" then
-            write("Local file to upload: ")
-            local localFile = read()
-            
-            if not fs.exists(localFile) then
-                print("File not found: " .. localFile)
+            write("Local file: ")
+            local src = read()
+            if not fs.exists(src) or fs.isDir(src) then
+                print("Not found or is directory")
             else
-                if fs.isDir(localFile) then
-                    print("Cannot upload directories yet")
-                else
-                    local f = fs.open(localFile, "r")
-                    local data = f.readAll()
-                    f.close()
-                    
-                    write("Save as [" .. fs.getName(localFile) .. "]: ")
-                    local jbodName = read()
-                    if jbodName == "" then
-                        jbodName = fs.getName(localFile)
-                    end
-                    
-                    print("Uploading " .. self:formatBytes(#data) .. "...")
-                    local ok, err = self:writeFile(jbodName, data)
-                    if ok then
-                        print("Success! Saved to drive " .. err)
-                    else
-                        print("Failed: " .. tostring(err))
-                    end
-                end
+                local h = fs.open(src, "r")
+                local data = h.readAll()
+                h.close()
+                
+                write("Save as [" .. fs.getName(src) .. "]: ")
+                local name = read()
+                if name == "" then name = fs.getName(src) end
+                
+                local ok, err = self:write(name, data)
+                print(ok and "Saved!" or "Failed: " .. tostring(err))
             end
             sleep(1)
             
         elseif cmd == "d" then
-            write("Filename to delete: ")
+            write("File to delete: ")
             local name = read()
-            write("Confirm delete '" .. name .. "'? (yes/no): ")
+            write("Confirm (yes): ")
             if read():lower() == "yes" then
-                local ok, err = self:deleteFile(name)
-                if ok then
-                    print("Deleted")
-                else
-                    print("Failed: " .. tostring(err))
-                end
+                local ok = self:delete(name)
+                print(ok and "Deleted" or "Failed")
             else
                 print("Cancelled")
             end
             sleep(1)
-            
-        elseif cmd == "m" then
-            write("Source: ")
-            local src = read()
-            write("Destination: ")
-            local dst = read()
-            
-            local ok, err = self:moveFile(src, dst)
-            if ok then
-                print("Moved successfully")
-            else
-                print("Failed: " .. tostring(err))
-            end
-            sleep(1)
         end
     end
-end
-
--- ============================================
--- EXPORT API
--- ============================================
-
-function JBOD:exportAPI()
-    _G.JBOD_API = {
-        list = function() return self:listFiles() end,
-        read = function(name) return self:readFile(name) end,
-        write = function(name, data) return self:writeFile(name, data) end,
-        delete = function(name) return self:deleteFile(name) end,
-        move = function(src, dst) return self:moveFile(src, dst) end,
-        scan = function() return self:scanDrives() end,
-        getDrives = function() return self.drives end,
-        getStats = function() return self:getTotalPoolStats() end
-    }
 end
 
 -- ============================================
 -- MAIN
 -- ============================================
 
-local function main(args)
-    print("JBOD Network Storage v" .. JBOD.version)
-    
-    if args[1] == "daemon" then
-        JBOD:scanDrives()
-        JBOD:exportAPI()
-        print("Daemon running. API available as JBOD_API")
-        while true do
-            sleep(60)
-            JBOD:scanDrives()
-        end
-    elseif args[1] == "api" then
-        JBOD:scanDrives()
-        JBOD:exportAPI()
-        print("API exported")
-    else
-        JBOD:interactiveShell()
-    end
+local args = {...}
+if args[1] == "api" then
+    JBOD:scanDrives()
+    _G.JBOD = {
+        list = function() return JBOD:listFiles() end,
+        read = function(n) return JBOD:read(n) end,
+        write = function(n,d) return JBOD:write(n,d) end,
+        delete = function(n) return JBOD:delete(n) end,
+        stats = function() return JBOD:getPoolStats() end,
+        drives = function() return JBOD.drives end
+    }
+    print("JBOD API ready")
+else
+    JBOD:run()
 end
-
-main({...})
