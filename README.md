@@ -292,7 +292,7 @@
         term.setCursorPos(1, 1)
      
         print("====================================================")
-        print("|     Kritio Softworks Drive Manager    "          |")
+        print("=     Kritio Softworks Drive Manager    "          =")
         print("====================================================")
         print()
      
