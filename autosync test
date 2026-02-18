@@ -1,13 +1,37 @@
 -- ============================================
--- KIRITO SOFTWORKS JBOD AUTO-SYNC CLIENT v4.3
--- Automatically syncs local folder to JBOD server
--- Watches for changes and auto-uploads/downloads
+-- KIRITO SOFTWORKS JBOD BACKGROUND DAEMON v4.4
+-- Runs continuously in background, auto-syncs everything
+-- Start with: jbod_daemon start
+-- Stop with:  jbod_daemon stop
 -- ============================================
 
-local SERVER_ID = nil
+local args = {...}
+local command = args[1] or "start"
+
+-- Daemon control file
+local DAEMON_FILE = "/.jbod_daemon_running"
+local LOG_FILE = "/jbod_daemon.log"
 local SYNC_FOLDER = "/sync"
+local SERVER_ID = nil
 local MODEM_SIDE = nil
-local running = true
+local running = false
+
+-- ============================================
+-- LOGGING
+-- ============================================
+
+function log(msg)
+    local time = os.date("%H:%M:%S")
+    local line = "[" .. time .. "] " .. msg
+    print(line)
+    
+    -- Append to log file
+    local h = fs.open(LOG_FILE, "a")
+    if h then
+        h.writeLine(line)
+        h.close()
+    end
+end
 
 -- ============================================
 -- MODEM & CONNECTION
@@ -19,7 +43,7 @@ function openModem()
         if peripheral.getType(side) == "modem" then
             MODEM_SIDE = side
             rednet.open(side)
-            print("Modem opened on " .. side)
+            log("Modem opened on " .. side)
             return true
         end
     end
@@ -27,7 +51,7 @@ function openModem()
         if peripheral.getType(name) == "modem" then
             MODEM_SIDE = name
             rednet.open(name)
-            print("Modem opened: " .. name)
+            log("Modem opened: " .. name)
             return true
         end
     end
@@ -35,26 +59,20 @@ function openModem()
 end
 
 function findServer()
-    print("Searching for JBOD server...")
+    log("Searching for JBOD server...")
     rednet.broadcast({ action = "discover" }, "jbod")
     
-    local timer = os.startTimer(3)
+    local timer = os.startTimer(5)
     while true do
         local event, id, msg, protocol = os.pullEvent()
         if event == "rednet_message" and protocol == "jbod" and msg and msg.server then
-            print("Found server at computer " .. id)
+            log("Found server at computer " .. id)
             SERVER_ID = id
             return true
         elseif event == "timer" and id == timer then
             return false
         end
     end
-end
-
-function connect(id)
-    SERVER_ID = id
-    print("Connected to server " .. id)
-    return true
 end
 
 -- ============================================
@@ -122,15 +140,15 @@ function serverDelete(filename)
 end
 
 -- ============================================
--- AUTO-SYNC LOGIC
+-- SYNC LOGIC
 -- ============================================
 
-function getLocalFiles(folder)
+function getLocalFiles()
     local files = {}
-    if not fs.isDir(folder) then return files end
+    if not fs.isDir(SYNC_FOLDER) then return files end
     
-    for _, name in ipairs(fs.list(folder)) do
-        local path = folder .. "/" .. name
+    for _, name in ipairs(fs.list(SYNC_FOLDER)) do
+        local path = SYNC_FOLDER .. "/" .. name
         if not fs.isDir(path) then
             local h = fs.open(path, "r")
             local data = h.readAll()
@@ -138,238 +156,235 @@ function getLocalFiles(folder)
             files[name] = {
                 data = data,
                 size = #data,
-                modified = fs.getSize(path) -- Use size as modification check
+                hash = #data -- Simple hash = size
             }
         end
     end
     return files
 end
 
-function syncToServer()
-    print("[" .. os.time() .. "] Syncing to server...")
+function fullSync()
+    log("Starting full sync...")
     
-    local localFiles = getLocalFiles(SYNC_FOLDER)
+    -- Ensure folders exist
+    if not fs.exists(SYNC_FOLDER) then
+        fs.makeDir(SYNC_FOLDER)
+        log("Created sync folder: " .. SYNC_FOLDER)
+    end
+    
+    local localFiles = getLocalFiles()
     local serverFiles = serverList() or {}
     
-    -- Create server file lookup
+    -- Build lookups
     local serverLookup = {}
     for _, name in ipairs(serverFiles) do
         serverLookup[name] = true
     end
     
-    -- Upload new/changed files
-    for name, info in pairs(localFiles) do
-        if not serverLookup[name] then
-            print("  Uploading: " .. name .. " (" .. info.size .. " bytes)")
-            if serverWrite(name, info.data) then
-                print("    OK")
-            else
-                print("    FAILED")
-            end
-        end
-    end
-    
-    print("Sync complete")
-end
-
-function syncFromServer()
-    print("[" .. os.time() .. "] Syncing from server...")
-    
-    -- Create sync folder if needed
-    if not fs.exists(SYNC_FOLDER) then
-        fs.makeDir(SYNC_FOLDER)
-    end
-    
-    local serverFiles = serverList() or {}
-    local localFiles = getLocalFiles(SYNC_FOLDER)
-    
-    -- Download files that exist on server but not locally
-    for _, name in ipairs(serverFiles) do
-        if not localFiles[name] then
-            print("  Downloading: " .. name)
-            local data = serverRead(name)
-            if data then
-                local h = fs.open(SYNC_FOLDER .. "/" .. name, "w")
-                h.write(data)
-                h.close()
-                print("    OK")
-            else
-                print("    FAILED")
-            end
-        end
-    end
-    
-    print("Sync complete")
-end
-
-function twoWaySync()
-    print("[" .. os.time() .. "] Two-way sync...")
-    
-    -- Create sync folder if needed
-    if not fs.exists(SYNC_FOLDER) then
-        fs.makeDir(SYNC_FOLDER)
-    end
-    
-    local localFiles = getLocalFiles(SYNC_FOLDER)
-    local serverFiles = serverList() or {}
-    
-    -- Create lookups
     local localLookup = {}
     for name, info in pairs(localFiles) do
         localLookup[name] = info
     end
     
-    local serverLookup = {}
-    for _, name in ipairs(serverFiles) do
-        serverLookup[name] = true
-    end
+    local uploads = 0
+    local downloads = 0
+    local deletes = 0
     
-    -- Upload local-only files to server
+    -- 1. Upload local files that don't exist on server
     for name, info in pairs(localFiles) do
         if not serverLookup[name] then
-            print("  >> Upload: " .. name)
-            serverWrite(name, info.data)
+            log("UPLOAD: " .. name .. " (" .. info.size .. " bytes)")
+            if serverWrite(name, info.data) then
+                uploads = uploads + 1
+            else
+                log("  FAILED to upload " .. name)
+            end
         end
     end
     
-    -- Download server-only files to local
+    -- 2. Download server files that don't exist locally
     for _, name in ipairs(serverFiles) do
         if not localLookup[name] then
-            print("  << Download: " .. name)
+            log("DOWNLOAD: " .. name)
             local data = serverRead(name)
             if data then
                 local h = fs.open(SYNC_FOLDER .. "/" .. name, "w")
                 h.write(data)
                 h.close()
+                downloads = downloads + 1
+            else
+                log("  FAILED to download " .. name)
             end
         end
     end
     
-    print("  Synced!")
+    log("Sync complete: " .. uploads .. " up, " .. downloads .. " down")
+    return uploads, downloads
 end
 
--- ============================================
--- WATCH MODE - Continuous sync
--- ============================================
-
-function watchMode()
-    print("Starting watch mode...")
-    print("Monitoring: " .. SYNC_FOLDER)
-    print("Press 'Q' to quit")
-    print()
-    
-    -- Initial sync
-    twoWaySync()
-    
-    local lastLocal = getLocalFiles(SYNC_FOLDER)
+function watchAndSync()
+    log("Starting watch mode...")
+    local lastFiles = getLocalFiles()
     
     while running do
-        -- Check for quit
-        local timer = os.startTimer(2)
-        local event = {os.pullEvent()}
+        sleep(2) -- Check every 2 seconds
         
-        if event[1] == "timer" and event[2] == timer then
-            -- Timer fired - check for changes
-            local currentLocal = getLocalFiles(SYNC_FOLDER)
-            local changed = false
-            
-            -- Check for new or modified files
-            for name, info in pairs(currentLocal) do
-                if not lastLocal[name] then
-                    print("[AUTO] New file: " .. name)
-                    serverWrite(name, info.data)
-                    changed = true
-                elseif lastLocal[name].size ~= info.size then
-                    print("[AUTO] Modified: " .. name)
-                    serverWrite(name, info.data)
-                    changed = true
-                end
-            end
-            
-            -- Check for deleted files
-            for name, info in pairs(lastLocal) do
-                if not currentLocal[name] then
-                    print("[AUTO] Deleted: " .. name)
-                    -- Optionally delete from server too:
-                    -- serverDelete(name)
-                    changed = true
-                end
-            end
-            
-            if changed then
-                print("[AUTO] Sync complete")
-                print()
-            end
-            
-            lastLocal = currentLocal
-            
-        elseif event[1] == "key" then
-            local key = event[2]
-            if key == keys.q then
-                running = false
-                print("Stopping...")
+        if not running then break end
+        
+        local currentFiles = getLocalFiles()
+        local serverFiles = serverList() or {}
+        local serverLookup = {}
+        for _, name in ipairs(serverFiles) do
+            serverLookup[name] = true
+        end
+        
+        -- Check for new/modified local files -> Upload
+        for name, info in pairs(currentFiles) do
+            if not lastFiles[name] then
+                -- New file
+                log("AUTO-UPLOAD (new): " .. name)
+                serverWrite(name, info.data)
+            elseif lastFiles[name].hash ~= info.hash then
+                -- Modified file
+                log("AUTO-UPLOAD (modified): " .. name)
+                serverWrite(name, info.data)
             end
         end
+        
+        -- Check for deleted local files -> Delete from server
+        for name, info in pairs(lastFiles) do
+            if not currentFiles[name] then
+                log("AUTO-DELETE: " .. name)
+                serverDelete(name)
+            end
+        end
+        
+        -- Check for new server files -> Download
+        for _, name in ipairs(serverFiles) do
+            if not currentFiles[name] and not lastFiles[name] then
+                log("AUTO-DOWNLOAD: " .. name)
+                local data = serverRead(name)
+                if data then
+                    local h = fs.open(SYNC_FOLDER .. "/" .. name, "w")
+                    h.write(data)
+                    h.close()
+                end
+            end
+        end
+        
+        lastFiles = currentFiles
     end
 end
 
 -- ============================================
--- INTERACTIVE MENU
+-- DAEMON CONTROL
 -- ============================================
 
-function menu()
-    while true do
-        term.clear()
-        term.setCursorPos(1,1)
-        
-        print("===================================================")
-        print("     KIRITO SOFTWORKS AUTO-SYNC CLIENT")
-        print("===================================================")
-        print()
-        print("Sync Folder: " .. SYNC_FOLDER)
-        print("Server: " .. (SERVER_ID or "Not connected"))
-        print()
-        print("1. Sync to server (upload all)")
-        print("2. Sync from server (download all)")
-        print("3. Two-way sync (merge)")
-        print("4. Watch mode (auto-sync)")
-        print("5. Change sync folder")
-        print("6. Quit")
-        print()
-        write("Choice: ")
-        
-        local choice = read()
-        
-        if choice == "1" then
-            syncToServer()
-            print("Press Enter...")
-            read()
-            
-        elseif choice == "2" then
-            syncFromServer()
-            print("Press Enter...")
-            read()
-            
-        elseif choice == "3" then
-            twoWaySync()
-            print("Press Enter...")
-            read()
-            
-        elseif choice == "4" then
-            watchMode()
-            
-        elseif choice == "5" then
-            write("New folder path: ")
-            SYNC_FOLDER = read()
-            if SYNC_FOLDER == "" then SYNC_FOLDER = "/sync" end
-            if not fs.exists(SYNC_FOLDER) then
-                fs.makeDir(SYNC_FOLDER)
+function startDaemon()
+    -- Check if already running
+    if fs.exists(DAEMON_FILE) then
+        print("Daemon already running!")
+        print("Use 'jbod_daemon stop' to stop it first")
+        return
+    end
+    
+    -- Create control file
+    local h = fs.open(DAEMON_FILE, "w")
+    h.writeLine(tostring(os.getComputerID()))
+    h.close()
+    
+    log("===================================================")
+    log("KIRITO SOFTWORKS JBOD DAEMON STARTING")
+    log("===================================================")
+    
+    -- Open modem
+    if not openModem() then
+        log("ERROR: No modem found!")
+        fs.delete(DAEMON_FILE)
+        return
+    end
+    
+    -- Find server
+    if not findServer() then
+        log("ERROR: Could not find JBOD server!")
+        log("Make sure server is running and in range")
+        fs.delete(DAEMON_FILE)
+        return
+    end
+    
+    -- Initial sync
+    fullSync()
+    
+    -- Start watching
+    running = true
+    log("Daemon running. Monitoring: " .. SYNC_FOLDER)
+    log("Press 'Q' in this window to stop")
+    
+    -- Run sync in parallel with user input
+    parallel.waitForAny(
+        function() watchAndSync() end,
+        function()
+            while running do
+                local event, key = os.pullEvent("key")
+                if key == keys.q then
+                    log("Stop requested")
+                    running = false
+                end
             end
-            
-        elseif choice == "6" then
-            print("Goodbye!")
-            break
         end
+    )
+    
+    -- Cleanup
+    fs.delete(DAEMON_FILE)
+    log("Daemon stopped")
+end
+
+function stopDaemon()
+    if not fs.exists(DAEMON_FILE) then
+        print("Daemon not running")
+        return
+    end
+    
+    -- Read the computer ID that started it
+    local h = fs.open(DAEMON_FILE, "r")
+    local id = h.readLine()
+    h.close()
+    
+    if tonumber(id) == os.getComputerID() then
+        -- We started it, but we can't easily stop it from outside
+        -- Just delete the file and tell user to press Q
+        fs.delete(DAEMON_FILE)
+        print("Daemon stop signal sent")
+        print("Press 'Q' in the daemon window to fully stop")
+    else
+        print("Daemon started by different computer: " .. id)
+    end
+end
+
+function statusDaemon()
+    if fs.exists(DAEMON_FILE) then
+        local h = fs.open(DAEMON_FILE, "r")
+        local id = h.readLine()
+        h.close()
+        print("Daemon is RUNNING (started by computer " .. id .. ")")
+        print("Sync folder: " .. SYNC_FOLDER)
+        if fs.exists(LOG_FILE) then
+            print("Recent log:")
+            -- Show last 10 lines
+            local h2 = fs.open(LOG_FILE, "r")
+            local lines = {}
+            local line = h2.readLine()
+            while line do
+                table.insert(lines, line)
+                line = h2.readLine()
+            end
+            h2.close()
+            for i = math.max(1, #lines-9), #lines do
+                print("  " .. lines[i])
+            end
+        end
+    else
+        print("Daemon is NOT running")
     end
 end
 
@@ -377,50 +392,22 @@ end
 -- MAIN
 -- ============================================
 
-function main()
-    print("===================================================")
-    print("     KIRITO SOFTWORKS AUTO-SYNC CLIENT")
-    print("===================================================")
-    print()
-    
-    -- Open modem
-    if not openModem() then
-        print("ERROR: No modem found!")
-        return
+if command == "start" then
+    startDaemon()
+elseif command == "stop" then
+    stopDaemon()
+elseif command == "status" then
+    statusDaemon()
+elseif command == "once" then
+    -- One-time sync without daemon
+    log("One-time sync...")
+    if openModem() and findServer() then
+        fullSync()
     end
-    
-    -- Connect to server
-    print("1. Auto-discover")
-    print("2. Enter server ID")
-    write("Choice: ")
-    local c = read()
-    
-    if c == "1" then
-        if not findServer() then
-            print("Server not found!")
-            write("Enter ID manually: ")
-            local id = tonumber(read())
-            if id then connect(id) end
-        end
-    else
-        write("Server ID: ")
-        local id = tonumber(read())
-        if id then connect(id) end
-    end
-    
-    if not SERVER_ID then
-        print("Not connected!")
-        return
-    end
-    
-    -- Create sync folder
-    if not fs.exists(SYNC_FOLDER) then
-        fs.makeDir(SYNC_FOLDER)
-        print("Created folder: " .. SYNC_FOLDER)
-    end
-    
-    print()
-    menu()
+else
+    print("Usage: jbod_daemon [start|stop|status|once]")
+    print("  start  - Start background daemon")
+    print("  stop   - Stop daemon")
+    print("  status - Check if running")
+    print("  once   - One-time sync")
 end
-
-main()
