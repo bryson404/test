@@ -1,0 +1,426 @@
+-- ============================================
+-- KIRITO SOFTWORKS JBOD AUTO-SYNC CLIENT v4.3
+-- Automatically syncs local folder to JBOD server
+-- Watches for changes and auto-uploads/downloads
+-- ============================================
+
+local SERVER_ID = nil
+local SYNC_FOLDER = "/sync"
+local MODEM_SIDE = nil
+local running = true
+
+-- ============================================
+-- MODEM & CONNECTION
+-- ============================================
+
+function openModem()
+    local sides = {"top", "bottom", "left", "right", "front", "back"}
+    for _, side in ipairs(sides) do
+        if peripheral.getType(side) == "modem" then
+            MODEM_SIDE = side
+            rednet.open(side)
+            print("Modem opened on " .. side)
+            return true
+        end
+    end
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            MODEM_SIDE = name
+            rednet.open(name)
+            print("Modem opened: " .. name)
+            return true
+        end
+    end
+    return false
+end
+
+function findServer()
+    print("Searching for JBOD server...")
+    rednet.broadcast({ action = "discover" }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg, protocol = os.pullEvent()
+        if event == "rednet_message" and protocol == "jbod" and msg and msg.server then
+            print("Found server at computer " .. id)
+            SERVER_ID = id
+            return true
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+function connect(id)
+    SERVER_ID = id
+    print("Connected to server " .. id)
+    return true
+end
+
+-- ============================================
+-- SERVER OPERATIONS
+-- ============================================
+
+function serverList()
+    if not SERVER_ID then return nil end
+    rednet.send(SERVER_ID, { action = "list" }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.files or {}
+        elseif event == "timer" and id == timer then
+            return nil
+        end
+    end
+end
+
+function serverRead(filename)
+    if not SERVER_ID then return nil end
+    rednet.send(SERVER_ID, { action = "read", file = filename }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.data
+        elseif event == "timer" and id == timer then
+            return nil
+        end
+    end
+end
+
+function serverWrite(filename, data)
+    if not SERVER_ID then return false end
+    rednet.send(SERVER_ID, { action = "write", file = filename, data = data }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.success
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+function serverDelete(filename)
+    if not SERVER_ID then return false end
+    rednet.send(SERVER_ID, { action = "delete", file = filename }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.success
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+-- ============================================
+-- AUTO-SYNC LOGIC
+-- ============================================
+
+function getLocalFiles(folder)
+    local files = {}
+    if not fs.isDir(folder) then return files end
+    
+    for _, name in ipairs(fs.list(folder)) do
+        local path = folder .. "/" .. name
+        if not fs.isDir(path) then
+            local h = fs.open(path, "r")
+            local data = h.readAll()
+            h.close()
+            files[name] = {
+                data = data,
+                size = #data,
+                modified = fs.getSize(path) -- Use size as modification check
+            }
+        end
+    end
+    return files
+end
+
+function syncToServer()
+    print("[" .. os.time() .. "] Syncing to server...")
+    
+    local localFiles = getLocalFiles(SYNC_FOLDER)
+    local serverFiles = serverList() or {}
+    
+    -- Create server file lookup
+    local serverLookup = {}
+    for _, name in ipairs(serverFiles) do
+        serverLookup[name] = true
+    end
+    
+    -- Upload new/changed files
+    for name, info in pairs(localFiles) do
+        if not serverLookup[name] then
+            print("  Uploading: " .. name .. " (" .. info.size .. " bytes)")
+            if serverWrite(name, info.data) then
+                print("    OK")
+            else
+                print("    FAILED")
+            end
+        end
+    end
+    
+    print("Sync complete")
+end
+
+function syncFromServer()
+    print("[" .. os.time() .. "] Syncing from server...")
+    
+    -- Create sync folder if needed
+    if not fs.exists(SYNC_FOLDER) then
+        fs.makeDir(SYNC_FOLDER)
+    end
+    
+    local serverFiles = serverList() or {}
+    local localFiles = getLocalFiles(SYNC_FOLDER)
+    
+    -- Download files that exist on server but not locally
+    for _, name in ipairs(serverFiles) do
+        if not localFiles[name] then
+            print("  Downloading: " .. name)
+            local data = serverRead(name)
+            if data then
+                local h = fs.open(SYNC_FOLDER .. "/" .. name, "w")
+                h.write(data)
+                h.close()
+                print("    OK")
+            else
+                print("    FAILED")
+            end
+        end
+    end
+    
+    print("Sync complete")
+end
+
+function twoWaySync()
+    print("[" .. os.time() .. "] Two-way sync...")
+    
+    -- Create sync folder if needed
+    if not fs.exists(SYNC_FOLDER) then
+        fs.makeDir(SYNC_FOLDER)
+    end
+    
+    local localFiles = getLocalFiles(SYNC_FOLDER)
+    local serverFiles = serverList() or {}
+    
+    -- Create lookups
+    local localLookup = {}
+    for name, info in pairs(localFiles) do
+        localLookup[name] = info
+    end
+    
+    local serverLookup = {}
+    for _, name in ipairs(serverFiles) do
+        serverLookup[name] = true
+    end
+    
+    -- Upload local-only files to server
+    for name, info in pairs(localFiles) do
+        if not serverLookup[name] then
+            print("  >> Upload: " .. name)
+            serverWrite(name, info.data)
+        end
+    end
+    
+    -- Download server-only files to local
+    for _, name in ipairs(serverFiles) do
+        if not localLookup[name] then
+            print("  << Download: " .. name)
+            local data = serverRead(name)
+            if data then
+                local h = fs.open(SYNC_FOLDER .. "/" .. name, "w")
+                h.write(data)
+                h.close()
+            end
+        end
+    end
+    
+    print("  Synced!")
+end
+
+-- ============================================
+-- WATCH MODE - Continuous sync
+-- ============================================
+
+function watchMode()
+    print("Starting watch mode...")
+    print("Monitoring: " .. SYNC_FOLDER)
+    print("Press 'Q' to quit")
+    print()
+    
+    -- Initial sync
+    twoWaySync()
+    
+    local lastLocal = getLocalFiles(SYNC_FOLDER)
+    
+    while running do
+        -- Check for quit
+        local timer = os.startTimer(2)
+        local event = {os.pullEvent()}
+        
+        if event[1] == "timer" and event[2] == timer then
+            -- Timer fired - check for changes
+            local currentLocal = getLocalFiles(SYNC_FOLDER)
+            local changed = false
+            
+            -- Check for new or modified files
+            for name, info in pairs(currentLocal) do
+                if not lastLocal[name] then
+                    print("[AUTO] New file: " .. name)
+                    serverWrite(name, info.data)
+                    changed = true
+                elseif lastLocal[name].size ~= info.size then
+                    print("[AUTO] Modified: " .. name)
+                    serverWrite(name, info.data)
+                    changed = true
+                end
+            end
+            
+            -- Check for deleted files
+            for name, info in pairs(lastLocal) do
+                if not currentLocal[name] then
+                    print("[AUTO] Deleted: " .. name)
+                    -- Optionally delete from server too:
+                    -- serverDelete(name)
+                    changed = true
+                end
+            end
+            
+            if changed then
+                print("[AUTO] Sync complete")
+                print()
+            end
+            
+            lastLocal = currentLocal
+            
+        elseif event[1] == "key" then
+            local key = event[2]
+            if key == keys.q then
+                running = false
+                print("Stopping...")
+            end
+        end
+    end
+end
+
+-- ============================================
+-- INTERACTIVE MENU
+-- ============================================
+
+function menu()
+    while true do
+        term.clear()
+        term.setCursorPos(1,1)
+        
+        print("===================================================")
+        print("     KIRITO SOFTWORKS AUTO-SYNC CLIENT")
+        print("===================================================")
+        print()
+        print("Sync Folder: " .. SYNC_FOLDER)
+        print("Server: " .. (SERVER_ID or "Not connected"))
+        print()
+        print("1. Sync to server (upload all)")
+        print("2. Sync from server (download all)")
+        print("3. Two-way sync (merge)")
+        print("4. Watch mode (auto-sync)")
+        print("5. Change sync folder")
+        print("6. Quit")
+        print()
+        write("Choice: ")
+        
+        local choice = read()
+        
+        if choice == "1" then
+            syncToServer()
+            print("Press Enter...")
+            read()
+            
+        elseif choice == "2" then
+            syncFromServer()
+            print("Press Enter...")
+            read()
+            
+        elseif choice == "3" then
+            twoWaySync()
+            print("Press Enter...")
+            read()
+            
+        elseif choice == "4" then
+            watchMode()
+            
+        elseif choice == "5" then
+            write("New folder path: ")
+            SYNC_FOLDER = read()
+            if SYNC_FOLDER == "" then SYNC_FOLDER = "/sync" end
+            if not fs.exists(SYNC_FOLDER) then
+                fs.makeDir(SYNC_FOLDER)
+            end
+            
+        elseif choice == "6" then
+            print("Goodbye!")
+            break
+        end
+    end
+end
+
+-- ============================================
+-- MAIN
+-- ============================================
+
+function main()
+    print("===================================================")
+    print("     KIRITO SOFTWORKS AUTO-SYNC CLIENT")
+    print("===================================================")
+    print()
+    
+    -- Open modem
+    if not openModem() then
+        print("ERROR: No modem found!")
+        return
+    end
+    
+    -- Connect to server
+    print("1. Auto-discover")
+    print("2. Enter server ID")
+    write("Choice: ")
+    local c = read()
+    
+    if c == "1" then
+        if not findServer() then
+            print("Server not found!")
+            write("Enter ID manually: ")
+            local id = tonumber(read())
+            if id then connect(id) end
+        end
+    else
+        write("Server ID: ")
+        local id = tonumber(read())
+        if id then connect(id) end
+    end
+    
+    if not SERVER_ID then
+        print("Not connected!")
+        return
+    end
+    
+    -- Create sync folder
+    if not fs.exists(SYNC_FOLDER) then
+        fs.makeDir(SYNC_FOLDER)
+        print("Created folder: " .. SYNC_FOLDER)
+    end
+    
+    print()
+    menu()
+end
+
+main()
