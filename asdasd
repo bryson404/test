@@ -1,0 +1,468 @@
+-- ============================================
+-- KIRITO SOFTWORKS NFS CLIENT v5.0
+-- Network File System Client - Run files directly from server!
+-- ============================================
+
+local SERVER_ID = nil
+local MODEM_SIDE = nil
+local MOUNT_POINT = "/net" -- Virtual mount point
+local FILE_CACHE = {} -- For streaming large files
+
+-- ============================================
+-- MODEM SETUP
+-- ============================================
+
+function openModem()
+    local sides = {"top", "bottom", "left", "right", "front", "back"}
+    for _, side in ipairs(sides) do
+        if peripheral.getType(side) == "modem" then
+            MODEM_SIDE = side
+            rednet.open(side)
+            return true
+        end
+    end
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "modem" then
+            MODEM_SIDE = name
+            rednet.open(name)
+            return true
+        end
+    end
+    return false
+end
+
+function findServer()
+    print("Searching for NFS server...")
+    rednet.broadcast({ action = "discover" }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg, protocol = os.pullEvent()
+        if event == "rednet_message" and protocol == "jbod" and msg and msg.server then
+            print("Found server at computer " .. id)
+            SERVER_ID = id
+            return true
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+function connect(serverId)
+    SERVER_ID = serverId
+    return true
+end
+
+-- ============================================
+-- NFS OPERATIONS
+-- ============================================
+
+function nfsList()
+    if not SERVER_ID then return nil end
+    rednet.send(SERVER_ID, { action = "list" }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.files or {}
+        elseif event == "timer" and id == timer then
+            return nil
+        end
+    end
+end
+
+function nfsRead(filename)
+    if not SERVER_ID then return nil end
+    rednet.send(SERVER_ID, { action = "read", file = filename }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.data
+        elseif event == "timer" and id == timer then
+            return nil
+        end
+    end
+end
+
+function nfsWrite(filename, data)
+    if not SERVER_ID then return false end
+    rednet.send(SERVER_ID, { action = "write", file = filename, data = data }, "jbod")
+    
+    local timer = os.startTimer(5)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.success
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+function nfsDelete(filename)
+    if not SERVER_ID then return false end
+    rednet.send(SERVER_ID, { action = "delete", file = filename }, "jbod")
+    
+    local timer = os.startTimer(3)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            return msg.success
+        elseif event == "timer" and id == timer then
+            return false
+        end
+    end
+end
+
+-- ============================================
+-- REMOTE EXECUTION - Run files directly from server!
+-- ============================================
+
+function nfsExecute(filename, ...)
+    if not SERVER_ID then 
+        print("Not connected to server!")
+        return false 
+    end
+    
+    print("Loading '" .. filename .. "' from server...")
+    
+    -- Request file execution
+    rednet.send(SERVER_ID, { 
+        action = "execute", 
+        file = filename,
+        args = {...}
+    }, "jbod")
+    
+    local timer = os.startTimer(10)
+    while true do
+        local event, id, msg = os.pullEvent()
+        if event == "rednet_message" and id == SERVER_ID then
+            if msg.success and msg.code then
+                print("Running remote file...")
+                print()
+                
+                -- Create a function from the code and run it
+                local func, err = load(msg.code, "=" .. filename, "t", _ENV)
+                if not func then
+                    print("Error loading: " .. tostring(err))
+                    return false
+                end
+                
+                -- Run with arguments
+                local ok, result = pcall(func, ...)
+                if not ok then
+                    print("Runtime error: " .. tostring(result))
+                    return false
+                end
+                
+                return true, result
+            else
+                print("Server error: " .. tostring(msg.error))
+                return false
+            end
+        elseif event == "timer" and id == timer then
+            print("Request timed out")
+            return false
+        end
+    end
+end
+
+-- Stream large files in chunks
+function nfsStreamExecute(filename, ...)
+    if not SERVER_ID then return false end
+    
+    print("Streaming '" .. filename .. "' from server...")
+    
+    rednet.send(SERVER_ID, { action = "stream_start", file = filename }, "jbod")
+    
+    local code = ""
+    local expecting = 0
+    local received = 0
+    
+    while true do
+        local event, id, msg = os.pullEvent()
+        
+        if event == "rednet_message" and id == SERVER_ID then
+            if msg.stream then
+                expecting = msg.chunks
+                print("Receiving " .. msg.size .. " bytes in " .. msg.chunks .. " chunks...")
+            elseif msg.stream_chunk then
+                code = code .. msg.data
+                received = received + 1
+                if received % 10 == 0 then
+                    print("  Progress: " .. received .. "/" .. expecting)
+                end
+            elseif msg.stream_end then
+                print("Complete! Running...")
+                print()
+                
+                -- Execute the assembled code
+                local func, err = load(code, "=" .. filename, "t", _ENV)
+                if not func then
+                    print("Error loading: " .. tostring(err))
+                    return false
+                end
+                
+                local ok, result = pcall(func, ...)
+                if not ok then
+                    print("Runtime error: " .. tostring(result))
+                    return false
+                end
+                return true, result
+            elseif msg.error then
+                print("Error: " .. msg.error)
+                return false
+            end
+        end
+    end
+end
+
+-- ============================================
+-- VIRTUAL FILESYSTEM
+-- ============================================
+
+function createVirtualDir()
+    if not fs.exists(MOUNT_POINT) then
+        fs.makeDir(MOUNT_POINT)
+    end
+    
+    -- Create a proxy directory that lists server files
+    local indexFile = MOUNT_POINT .. "/.index"
+    local h = fs.open(indexFile, "w")
+    if h then
+        h.writeLine("-- NFS Index --")
+        h.writeLine("Run 'nfs' to see files")
+        h.close()
+    end
+end
+
+function syncVirtualDir()
+    -- Sync server file list to virtual directory
+    local files = nfsList()
+    if not files then return end
+    
+    -- Clear old symlinks (we'll use empty files as markers)
+    if fs.exists(MOUNT_POINT) then
+        for _, f in ipairs(fs.list(MOUNT_POINT)) do
+            if f ~= ".index" then
+                fs.delete(MOUNT_POINT .. "/" .. f)
+            end
+        end
+    else
+        fs.makeDir(MOUNT_POINT)
+    end
+    
+    -- Create markers for server files
+    for _, fname in ipairs(files) do
+        local h = fs.open(MOUNT_POINT .. "/" .. fname .. ".remote", "w")
+        if h then
+            h.writeLine("REMOTE: " .. fname)
+            h.close()
+        end
+    end
+end
+
+-- ============================================
+-- SHELL INTEGRATION
+-- ============================================
+
+-- Override shell.run to check for remote files first
+local oldShellRun = shell.run
+
+function shell.run(command, ...)
+    -- Check if it's a remote file reference
+    if command:match("^net:") then
+        local filename = command:sub(5) -- Remove "net:" prefix
+        return nfsExecute(filename, ...)
+    end
+    
+    -- Check if file exists in virtual mount and is .lua
+    if fs.exists(MOUNT_POINT .. "/" .. command .. ".remote") then
+        -- It's a remote file, execute it
+        return nfsExecute(command .. ".lua", ...)
+    end
+    
+    -- Otherwise use normal shell
+    return oldShellRun(command, ...)
+end
+
+-- ============================================
+-- INTERACTIVE NFS SHELL
+-- ============================================
+
+function nfsShell()
+    print()
+    print("NFS Commands:")
+    print("  ls, dir          - List remote files")
+    print("  cat <file>       - View remote file")
+    print("  edit <file>      - Edit remote file")
+    print("  run <file>       - Run remote file directly")
+    print("  put <file>       - Upload local file")
+    print("  rm <file>        - Delete remote file")
+    print("  sync             - Sync virtual directory")
+    print("  local            - Drop to local shell")
+    print("  quit             - Exit")
+    print()
+    
+    while true do
+        write("nfs> ")
+        local input = read()
+        local args = {}
+        for word in input:gmatch("%S+") do table.insert(args, word) end
+        
+        local cmd = args[1] or ""
+        
+        if cmd == "quit" or cmd == "exit" then
+            break
+            
+        elseif cmd == "ls" or cmd == "dir" then
+            local files = nfsList()
+            if files then
+                print("Remote files:")
+                for _, f in ipairs(files) do
+                    print("  " .. f)
+                end
+                print("Total: " .. #files)
+            end
+            
+        elseif cmd == "cat" and args[2] then
+            local data = nfsRead(args[2])
+            if data then
+                print(data)
+            else
+                print("File not found")
+            end
+            
+        elseif cmd == "edit" and args[2] then
+            local data = nfsRead(args[2]) or ""
+            -- Save to temp, edit, upload back
+            local tmp = "/.nfs_edit_" .. args[2]
+            local h = fs.open(tmp, "w")
+            h.write(data)
+            h.close()
+            
+            shell.run("edit", tmp)
+            
+            -- Upload back
+            local h2 = fs.open(tmp, "r")
+            local newData = h2.readAll()
+            h2.close()
+            
+            if newData ~= data then
+                if nfsWrite(args[2], newData) then
+                    print("Saved to server")
+                else
+                    print("Failed to save")
+                end
+            end
+            fs.delete(tmp)
+            
+        elseif cmd == "run" and args[2] then
+            -- Remove .lua if user added it
+            local fname = args[2]:gsub("%.lua$", "") .. ".lua"
+            nfsExecute(fname, select(3, unpack(args)))
+            
+        elseif cmd == "put" and args[2] then
+            local localFile = args[2]
+            local remoteName = args[3] or fs.getName(localFile)
+            
+            if not fs.exists(localFile) then
+                print("Local file not found")
+            else
+                local h = fs.open(localFile, "r")
+                local data = h.readAll()
+                h.close()
+                
+                if nfsWrite(remoteName, data) then
+                    print("Uploaded: " .. remoteName)
+                else
+                    print("Upload failed")
+                end
+            end
+            
+        elseif cmd == "rm" and args[2] then
+            if nfsDelete(args[2]) then
+                print("Deleted: " .. args[2])
+            else
+                print("Delete failed")
+            end
+            
+        elseif cmd == "sync" then
+            syncVirtualDir()
+            print("Virtual directory synced")
+            
+        elseif cmd == "local" then
+            print("Dropping to local shell...")
+            print("Type 'exit' to return to NFS")
+            print()
+            shell.run("shell")
+            print()
+            print("Returned to NFS shell")
+            
+        elseif cmd ~= "" then
+            -- Try to run as remote file if it ends in .lua
+            if cmd:match("%.lua$") then
+                nfsExecute(cmd)
+            else
+                print("Unknown command: " .. cmd)
+            end
+        end
+    end
+end
+
+-- ============================================
+-- MAIN
+-- ============================================
+
+function main()
+    print("===================================================")
+    print("  KIRITO SOFTWORKS NFS CLIENT v5.0")
+    print("  Run files directly from server - no download!")
+    print("===================================================")
+    print()
+    
+    if not openModem() then
+        print("ERROR: No modem found!")
+        return
+    end
+    
+    print("1. Auto-discover server")
+    print("2. Enter server ID manually")
+    write("Choice: ")
+    local choice = read()
+    
+    if choice == "1" then
+        if not findServer() then
+            print("Server not found!")
+            write("Enter ID manually: ")
+            local id = tonumber(read())
+            if id then connect(id) end
+        end
+    else
+        write("Server ID: ")
+        local id = tonumber(read())
+        if id then connect(id) end
+    end
+    
+    if not SERVER_ID then
+        print("Not connected!")
+        return
+    end
+    
+    print()
+    print("Connected! Type 'help' for commands")
+    
+    -- Setup virtual directory
+    createVirtualDir()
+    syncVirtualDir()
+    
+    -- Start NFS shell
+    nfsShell()
+    
+    print("Goodbye!")
+end
+
+main()
